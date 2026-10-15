@@ -7,6 +7,7 @@ mod cli;
 mod clipboard;
 mod fsx;
 mod locks;
+mod login;
 mod slots;
 mod store;
 mod usage;

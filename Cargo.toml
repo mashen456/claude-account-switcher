@@ -1,6 +1,6 @@
 [package]
 name = "claude-slots"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Switch Claude Code between two accounts with one click, with usage display"
 license = "MIT"
@@ -13,9 +13,12 @@ base64 = "0.23"
 chrono = "0.4"
 dirs = "7"
 # OpenGL statt des standardmäßigen wgpu: deutlich kleinere exe, läuft auch auf macOS.
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+# "clipboard", damit Strg+V im Code-Feld des Login-Fensters funktioniert.
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow"] }
+getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 ureq = "3"
 
 [profile.release]

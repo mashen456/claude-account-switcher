@@ -14,8 +14,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -192,68 +190,77 @@ pub fn capture(slots: &SlotStore, n: usize) -> Result<Identity> {
     Ok(live.identity)
 }
 
-/// Kennung am Anfang eines exportierten Slots.
-const EXPORT_PREFIX: &str = "claude-slot:v1:";
-
-/// Slot als Text für die Zwischenablage: Kennung + Base64-JSON.
+/// Legt einen frisch eingeloggten Account (siehe `login.rs`) in Slot `n` ab.
 ///
-/// Beim aktiven Slot wird erst der aktuelle Stand von Claude Code übernommen,
-/// sonst enthielte der Export ein Token, das Claude Code längst erneuert hat.
-/// MCP- und Plugin-Logins gehören zum Rechner und werden weggelassen.
-pub fn export(slots: &SlotStore, n: usize) -> Result<(Identity, String)> {
-    let mut slot = slots.load(n)?.ok_or_else(|| anyhow!("Slot {n} ist leer"))?;
+/// Ist es der Account, mit dem Claude Code gerade arbeitet, bekommt auch
+/// Claude Code den neuen Login, sonst schriebe der nächste Wechsel den alten
+/// Stand über den neuen. Liefert zusätzlich, ob Claude Code umgestellt wurde.
+pub fn store_login(slots: &SlotStore, n: usize, mut slot: Slot) -> Result<(Identity, bool)> {
     let id = slot
         .identity()
-        .ok_or_else(|| anyhow!("Slot {n} enthält keinen Account"))?;
-    {
-        let creds = store::active()?;
-        let _locks = locks::claude_locks()?;
-        if let Some(live) = read_live_from(&*creds)? {
-            if live.identity.same_account(&id) && may_replace(&slot.credentials, &live.credentials) {
-                slot.credentials = live.credentials;
-                slot.oauth_account = live.oauth_account;
-                slot.saved_at = now();
-                slots.save(n, &slot)?;
-            }
-        }
-    }
-    if let Some(object) = slot.credentials.as_object_mut() {
-        for key in SHARED_KEYS {
-            object.remove(key);
-        }
-    }
-    let json = serde_json::to_vec(&slot)?;
-    Ok((id, format!("{EXPORT_PREFIX}{}", BASE64.encode(json))))
-}
-
-/// Liest einen exportierten Slot aus Text.
-pub fn parse_export(text: &str) -> Result<Slot> {
-    let data = text
-        .trim()
-        .strip_prefix(EXPORT_PREFIX)
-        .ok_or_else(|| anyhow!("Die Zwischenablage enthält keinen exportierten Slot"))?;
-    // Zeilenumbrüche, die Chat-Programme beim Weiterleiten einfügen, ignorieren.
-    let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-    let json = BASE64.decode(data).context("Der exportierte Slot ist beschädigt")?;
-    let slot: Slot = serde_json::from_slice(&json).context("Der exportierte Slot ist beschädigt")?;
-    if slot.identity().is_none() || !has_tokens(&slot.credentials) {
-        bail!("Der exportierte Slot enthält keinen gültigen Login");
-    }
-    Ok(slot)
-}
-
-/// Legt einen importierten Login in Slot `n` ab.
-pub fn import(slots: &SlotStore, n: usize, slot: Slot) -> Result<Identity> {
-    let id = slot
-        .identity()
-        .ok_or_else(|| anyhow!("Der Import enthält keinen Account"))?;
+        .ok_or_else(|| anyhow!("Die Anmeldung enthält keinen Account"))?;
     if let Some(other) = slots.find(&id)? {
         if other != n {
             bail!("{} liegt schon in Slot {other}", id.email);
         }
     }
-    slots.save(n, &Slot { saved_at: now(), ..slot })?;
-    Ok(id)
+    // Felder, die nur Claude Code nachlädt (z. B. Rollen), vom bisherigen Stand behalten.
+    if let Some(old) = slots.load(n)? {
+        if old.identity().is_some_and(|old_id| old_id.same_account(&id)) {
+            slot.oauth_account = merged(&old.oauth_account, &slot.oauth_account);
+        }
+    }
+
+    let creds = store::active()?;
+    let _locks = locks::claude_locks()?;
+    let live = read_live_from(&*creds)?;
+    slots.save(n, &slot)?;
+    let Some(live) = live.filter(|live| live.identity.same_account(&id)) else {
+        return Ok((id, false));
+    };
+    slots.write_safety_copy(&live)?;
+    write_live(
+        &*creds,
+        &with_shared_keys(&slot.credentials, Some(&live)),
+        &merged(&live.oauth_account, &slot.oauth_account),
+    )?;
+    Ok((id, true))
+}
+
+fn merged(base: &Value, overlay: &Value) -> Value {
+    let mut out = base.as_object().cloned().unwrap_or_default();
+    for (key, value) in overlay.as_object().into_iter().flatten() {
+        out.insert(key.clone(), value.clone());
+    }
+    Value::Object(out)
+}
+
+/// Account-gebundene Felder aus `target`, maschinenweite (MCP-Logins) vom aktuellen Stand.
+fn with_shared_keys(target: &Value, live: Option<&Live>) -> Value {
+    let mut credentials = target.clone();
+    if let (Some(object), Some(live)) = (credentials.as_object_mut(), live) {
+        for key in SHARED_KEYS {
+            match live.credentials.get(key) {
+                Some(value) => object.insert(key.to_string(), value.clone()),
+                None => object.remove(key),
+            };
+        }
+    }
+    credentials
+}
+
+/// Schreibt Token und Account für Claude Code. Scheitert die Konfiguration,
+/// wird das alte Token zurückgelegt.
+fn write_live(creds: &dyn CredentialStore, credentials: &Value, oauth_account: &Value) -> Result<()> {
+    let previous = creds.read()?;
+    creds.write(&serde_json::to_string(credentials)?)?;
+    if let Err(err) = claude::set_oauth_account(oauth_account) {
+        if let Some(previous) = previous {
+            let _ = creds.write(&previous);
+        }
+        return Err(err.context("Abgebrochen, alter Login wiederhergestellt"));
+    }
+    Ok(())
 }
 
 /// Macht Slot `target` zum Login von Claude Code.
@@ -298,30 +305,80 @@ pub fn switch_to(slots: &SlotStore, target: usize) -> Result<Identity> {
         }
     }
 
-    // 2. Ziel-Token zusammensetzen: account-gebundene Felder aus dem Slot,
-    //    maschinenweite (MCP-Logins) vom aktuellen Stand.
-    let mut credentials = target_slot.credentials.clone();
-    if let (Some(object), Some(live)) = (credentials.as_object_mut(), &live) {
-        for key in SHARED_KEYS {
-            match live.credentials.get(key) {
-                Some(value) => object.insert(key.to_string(), value.clone()),
-                None => object.remove(key),
-            };
-        }
-    }
-
-    // 3. Schreiben. Scheitert die Konfiguration, das alte Token zurücklegen.
-    let previous = creds.read()?;
-    creds.write(&serde_json::to_string(&credentials)?)?;
-    if let Err(err) = claude::set_oauth_account(&target_slot.oauth_account) {
-        if let Some(previous) = previous {
-            let _ = creds.write(&previous);
-        }
-        return Err(err.context("Wechsel abgebrochen, alter Login wiederhergestellt"));
-    }
+    // 2. Ziel-Slot für Claude Code schreiben.
+    write_live(
+        &*creds,
+        &with_shared_keys(&target_slot.credentials, live.as_ref()),
+        &target_slot.oauth_account,
+    )?;
     Ok(target_id)
 }
 
 fn now() -> String {
     chrono::Local::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn login_slot(who: &str, refresh: &str) -> Slot {
+        Slot {
+            credentials: json!({ "claudeAiOauth": { "accessToken": format!("at-{refresh}"),
+                                                    "refreshToken": refresh } }),
+            oauth_account: json!({ "accountUuid": format!("uuid-{who}"),
+                                   "emailAddress": format!("{who}@example.com"),
+                                   "organizationUuid": format!("org-{who}") }),
+            saved_at: now(),
+        }
+    }
+
+    fn read(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Einziger Test, der Umgebungsvariablen setzt (Tests laufen parallel).
+    #[test]
+    fn store_login_updates_claude_code_only_for_its_account() {
+        let root = std::env::temp_dir().join(format!("claude-slots-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let config = root.join("claude");
+        fs::create_dir_all(&config).unwrap();
+        // SAFETY: kein anderer Test liest oder setzt Umgebungsvariablen.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+            std::env::set_var("CLAUDE_SLOTS_DIR", root.join("slots"));
+        }
+        let live_creds = json!({ "claudeAiOauth": { "accessToken": "at-A-old", "refreshToken": "A-old" },
+                                 "mcpOAuth": { "server": "live" } });
+        fs::write(config.join(".credentials.json"), live_creds.to_string()).unwrap();
+        let live_config = json!({ "projects": { "x": {} },
+                                  "oauthAccount": { "accountUuid": "uuid-a", "emailAddress": "a@example.com",
+                                                    "organizationUuid": "org-a", "organizationRole": "admin" } });
+        fs::write(config.join(".claude.json"), live_config.to_string()).unwrap();
+        let slots = SlotStore::open().unwrap();
+
+        // Anderer Account in leeren Slot: Claude Code bleibt unberührt.
+        let (id, live) = store_login(&slots, 2, login_slot("b", "B1")).unwrap();
+        assert_eq!((id.email.as_str(), live), ("b@example.com", false));
+        assert_eq!(read(&config.join(".credentials.json")), live_creds);
+
+        // Neuer Login für den aktiven Account: Claude Code bekommt ihn auch.
+        let (_, live) = store_login(&slots, 1, login_slot("a", "A-new")).unwrap();
+        assert!(live);
+        let creds = read(&config.join(".credentials.json"));
+        assert_eq!(creds["claudeAiOauth"]["refreshToken"], "A-new");
+        assert_eq!(creds["mcpOAuth"]["server"], "live");
+        let cfg = read(&config.join(".claude.json"));
+        assert_eq!(cfg["oauthAccount"]["organizationRole"], "admin");
+        assert!(cfg["projects"]["x"].is_object());
+        assert_eq!(slots.load(1).unwrap().unwrap().credentials["claudeAiOauth"]["refreshToken"], "A-new");
+        assert!(root.join("slots").join("last-live.json").exists());
+
+        // Derselbe Account nicht in zwei Slots.
+        assert!(store_login(&slots, 2, login_slot("a", "A-x")).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -14,7 +14,17 @@ use serde_json::Value;
 use crate::fsx;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const OAUTH_BETA: &str = "oauth-2025-04-20";
+pub const OAUTH_BETA: &str = "oauth-2025-04-20";
+pub const USER_AGENT: &str = concat!("claude-slots/", env!("CARGO_PKG_VERSION"));
+
+/// HTTP-Client mit Zeitlimit, der Fehlerstatus als normale Antwort liefert.
+pub fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,16 +102,11 @@ pub fn token_of(credentials: &Value) -> Option<Token> {
 }
 
 pub fn fetch(access_token: &str) -> Result<Usage, FetchError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent
+    let mut response = agent()
         .get(USAGE_URL)
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-beta", OAUTH_BETA)
-        .header("User-Agent", concat!("claude-slots/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| FetchError::Network(e.to_string()))?;
     match response.status().as_u16() {

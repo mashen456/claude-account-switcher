@@ -10,6 +10,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::claude::{self, Identity};
 use crate::clipboard;
+use crate::login::PendingLogin;
 use crate::slots::{self, Live, SLOT_COUNT, Slot, SlotStore};
 use crate::usage::{self, FetchError, Usage, UsageCache, Window};
 
@@ -25,9 +26,26 @@ const AMBER: Color32 = Color32::from_rgb(220, 160, 50);
 const RED: Color32 = Color32::from_rgb(210, 70, 60);
 const GRAY: Color32 = Color32::from_rgb(150, 150, 150);
 
-struct UsageMsg {
-    key: String,
-    result: Result<Usage, FetchError>,
+/// Ergebnisse aus Hintergrund-Threads (Netzwerk).
+enum Msg {
+    Usage {
+        key: String,
+        result: Result<Usage, FetchError>,
+    },
+    Login {
+        slot: usize,
+        result: anyhow::Result<Slot>,
+    },
+}
+
+/// Das Fenster "Neu einloggen".
+struct LoginDialog {
+    slot: usize,
+    login: PendingLogin,
+    code: String,
+    busy: bool,
+    copied: bool,
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -57,8 +75,7 @@ impl Status {
 enum Action {
     Switch(usize),
     Capture(usize),
-    Export(usize),
-    Import(usize),
+    Login(usize),
     /// Die Rückfrage zum Überschreiben wurde bestätigt.
     Confirm,
     Refresh,
@@ -67,7 +84,7 @@ enum Action {
 /// Wartet auf Bestätigung, weil ein Slot mit einem anderen Account überschrieben würde.
 enum Pending {
     Capture(usize),
-    Import { slot: usize, data: Slot, text: String },
+    Login { slot: usize, data: Slot },
 }
 
 pub struct App {
@@ -79,8 +96,9 @@ pub struct App {
     usage: HashMap<String, UsageState>,
     status: Option<Status>,
     pending: Option<Pending>,
-    tx: Sender<UsageMsg>,
-    rx: Receiver<UsageMsg>,
+    login: Option<LoginDialog>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
     last_reload: Option<Instant>,
     last_usage: Option<Instant>,
 }
@@ -99,6 +117,7 @@ impl App {
             usage: HashMap::new(),
             status: None,
             pending: None,
+            login: None,
             tx,
             rx,
             last_reload: None,
@@ -183,7 +202,7 @@ impl App {
             let (tx, ctx, key) = (self.tx.clone(), ctx.clone(), id.key());
             std::thread::spawn(move || {
                 let result = usage::fetch(&token.value);
-                let _ = tx.send(UsageMsg { key, result });
+                let _ = tx.send(Msg::Usage { key, result });
                 ctx.request_repaint();
             });
         }
@@ -191,16 +210,42 @@ impl App {
 
     fn receive(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
-            let state = self.usage.entry(msg.key.clone()).or_default();
-            state.loading = false;
-            match msg.result {
-                Ok(usage) => {
-                    state.note = None;
-                    if let Some(cache) = &mut self.cache {
-                        cache.put(msg.key, usage);
+            match msg {
+                Msg::Usage { key, result } => {
+                    let state = self.usage.entry(key.clone()).or_default();
+                    state.loading = false;
+                    match result {
+                        Ok(usage) => {
+                            state.note = None;
+                            if let Some(cache) = &mut self.cache {
+                                cache.put(key, usage);
+                            }
+                        }
+                        Err(err) => state.note = Some(err.to_string()),
                     }
                 }
-                Err(err) => state.note = Some(err.to_string()),
+                Msg::Login { slot, result } => self.login_finished(slot, result),
+            }
+        }
+    }
+
+    fn login_finished(&mut self, slot: usize, result: anyhow::Result<Slot>) {
+        // Fenster inzwischen geschlossen oder ein neuer Versuch: Ergebnis verwerfen.
+        let Some(dialog) = self.login.as_mut().filter(|d| d.slot == slot && d.busy) else {
+            return;
+        };
+        dialog.busy = false;
+        match result {
+            Err(err) => dialog.error = Some(format!("{err:#}")),
+            Ok(data) => {
+                self.login = None;
+                if self.overwrites_other(slot, data.identity().as_ref()) {
+                    self.pending = Some(Pending::Login { slot, data });
+                } else {
+                    self.status = Some(self.store_login(slot, data));
+                    self.reload();
+                    self.last_usage = None;
+                }
             }
         }
     }
@@ -221,13 +266,13 @@ impl App {
         }
     }
 
-    fn import(&self, n: usize, data: Slot, text: &str) -> Status {
-        match self.store().and_then(|store| slots::import(store, n, data)) {
-            Ok(id) => {
-                // Das Token soll nicht länger als nötig in der Zwischenablage liegen.
-                clipboard::clear_if(text);
-                Status::ok(format!("{} aus der Zwischenablage in Slot {n} übernommen.", id.email))
-            }
+    fn store_login(&self, n: usize, data: Slot) -> Status {
+        match self.store().and_then(|store| slots::store_login(store, n, data)) {
+            Ok((id, false)) => Status::ok(format!("{} in Slot {n} eingeloggt.", id.email)),
+            Ok((id, true)) => Status::ok(format!(
+                "{} in Slot {n} eingeloggt. Claude Code nutzt den neuen Login ebenfalls.",
+                id.email
+            )),
             Err(err) => Status::error(err),
         }
     }
@@ -258,38 +303,26 @@ impl App {
                 }
                 self.status = Some(self.capture(n));
             }
-            Action::Export(n) => {
-                let result = self
-                    .store()
-                    .and_then(|store| slots::export(store, n))
-                    .and_then(|(id, text)| clipboard::set_secret(&text).map(|()| id));
-                self.status = Some(match result {
-                    Ok(id) => Status::ok(format!(
-                        "Slot {n} ({}) liegt in der Zwischenablage. Das Token gilt nur einmal: \
-                         den Account danach nur auf einem Rechner benutzen.",
-                        id.email
-                    )),
-                    Err(err) => Status::error(err),
-                });
-            }
-            Action::Import(n) => {
-                let parsed = clipboard::get()
-                    .and_then(|text| slots::parse_export(&text).map(|data| (data, text)));
-                match parsed {
-                    Err(err) => self.status = Some(Status::error(err)),
-                    Ok((data, text)) => {
-                        if self.overwrites_other(n, data.identity().as_ref()) {
-                            self.pending = Some(Pending::Import { slot: n, data, text });
-                            return;
-                        }
-                        self.status = Some(self.import(n, data, &text));
+            Action::Login(n) => {
+                match PendingLogin::start() {
+                    Ok(login) => {
+                        self.login = Some(LoginDialog {
+                            slot: n,
+                            login,
+                            code: String::new(),
+                            busy: false,
+                            copied: false,
+                            error: None,
+                        });
                     }
+                    Err(err) => self.status = Some(Status::error(err)),
                 }
+                return;
             }
             Action::Confirm => match self.pending.take() {
                 Some(Pending::Capture(n)) => self.status = Some(self.capture(n)),
-                Some(Pending::Import { slot, data, text }) => {
-                    self.status = Some(self.import(slot, data, &text));
+                Some(Pending::Login { slot, data }) => {
+                    self.status = Some(self.store_login(slot, data));
                 }
                 None => {}
             },
@@ -380,28 +413,16 @@ impl App {
                     {
                         *action = Some(Action::Capture(n));
                     }
-                    ui.menu_button("Zwischenablage", |ui| {
-                        if ui
-                            .add_enabled(slot.is_some(), egui::Button::new("Exportieren"))
-                            .on_hover_text(
-                                "Kopiert den Login dieses Slots samt Token in die Zwischenablage, \
-                                 z. B. für einen anderen Rechner. Das Token gilt nur einmal: den \
-                                 Account danach nur noch auf einem Rechner benutzen.",
-                            )
-                            .clicked()
-                        {
-                            *action = Some(Action::Export(n));
-                            ui.close();
-                        }
-                        if ui
-                            .button("Importieren")
-                            .on_hover_text("Legt einen exportierten Login in diesem Slot ab.")
-                            .clicked()
-                        {
-                            *action = Some(Action::Import(n));
-                            ui.close();
-                        }
-                    });
+                    if ui
+                        .button("Neu einloggen")
+                        .on_hover_text(
+                            "Mit einem Account einloggen, ohne Claude Code abzumelden. Jeder \
+                             Login ist eigenständig, auch auf mehreren PCs gleichzeitig.",
+                        )
+                        .clicked()
+                    {
+                        *action = Some(Action::Login(n));
+                    }
                 });
             });
     }
@@ -467,13 +488,93 @@ impl App {
         });
         ui.label(
             RichText::new(
-                "Zweiten Account einrichten: in Claude Code /login (nicht /logout), \
-                 dann \"Login übernehmen\".",
+                "Account einrichten: bei einem Slot \"Neu einloggen\", oder den aktuellen \
+                 Login von Claude Code mit \"Login übernehmen\" speichern.",
             )
             .small()
             .weak(),
         );
         ui.add_space(6.0);
+    }
+
+    fn login_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.login else { return };
+        let (mut submit, mut cancel) = (false, false);
+        let response = egui::Modal::new(egui::Id::unique("login")).show(ctx, |ui| {
+            ui.set_max_width(400.0);
+            ui.heading(format!("Slot {}: einloggen", dialog.slot));
+            ui.add_space(6.0);
+            ui.label("1. Link öffnen und mit dem Account anmelden, der in diesen Slot soll.");
+            ui.label(
+                RichText::new(
+                    "Ist der Browser schon mit einem anderen Claude-Account angemeldet: \
+                     Link kopieren und in einem privaten Fenster öffnen.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Im Browser öffnen").clicked() {
+                    open_url(&dialog.login.url);
+                }
+                let label = if dialog.copied { "Kopiert" } else { "Link kopieren" };
+                if ui.button(label).clicked() {
+                    match clipboard::set(&dialog.login.url) {
+                        Ok(()) => dialog.copied = true,
+                        Err(err) => dialog.error = Some(format!("{err:#}")),
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.label("2. Nach der Anmeldung zeigt die Seite einen Code. Hier einfügen:");
+            ui.horizontal(|ui| {
+                let edit = ui.add_enabled(
+                    !dialog.busy,
+                    egui::TextEdit::singleline(&mut dialog.code)
+                        .hint_text("Code")
+                        .desired_width(280.0),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui.add_enabled(!dialog.busy, egui::Button::new("Einfügen")).clicked() {
+                    match clipboard::get() {
+                        Ok(text) => dialog.code = text.trim().to_string(),
+                        Err(err) => dialog.error = Some(format!("{err:#}")),
+                    }
+                }
+            });
+            if let Some(err) = &dialog.error {
+                ui.colored_label(RED, err.as_str());
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let ready = !dialog.busy && !dialog.code.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Anmelden")).clicked() {
+                    submit = true;
+                }
+                if ui.add_enabled(!dialog.busy, egui::Button::new("Abbrechen")).clicked() {
+                    cancel = true;
+                }
+                if dialog.busy {
+                    ui.spinner();
+                    ui.label("Anmeldung läuft …");
+                }
+            });
+        });
+        if submit && !dialog.busy && !dialog.code.trim().is_empty() {
+            dialog.busy = true;
+            dialog.error = None;
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            let (slot, login, code) = (dialog.slot, dialog.login.clone(), dialog.code.clone());
+            std::thread::spawn(move || {
+                let result = login.finish(&code);
+                let _ = tx.send(Msg::Login { slot, result });
+                ctx.request_repaint();
+            });
+        } else if !dialog.busy && (cancel || response.should_close()) {
+            self.login = None;
+        }
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
@@ -486,10 +587,10 @@ impl App {
                     .map(|live| live.identity.email.clone())
                     .unwrap_or_default(),
             ),
-            Some(Pending::Import { slot, data, .. }) => (
+            Some(Pending::Login { slot, data }) => (
                 *slot,
                 format!(
-                    "{} (aus der Zwischenablage)",
+                    "{} (neu eingeloggt)",
                     data.identity().map(|id| id.email).unwrap_or_default()
                 ),
             ),
@@ -537,6 +638,7 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| self.body(ui, &mut action));
         });
         let ctx = ui.ctx().clone();
+        self.login_dialog(&ctx);
         self.confirm_dialog(&ctx, &mut action);
         if let Some(action) = action {
             self.run(action);
@@ -576,6 +678,21 @@ fn window_row(ui: &mut egui::Ui, label: &str, window: &Window) {
 fn open_folder(dir: &std::path::Path) {
     let program = if cfg!(target_os = "macos") { "open" } else { "explorer" };
     let _ = std::process::Command::new(program).arg(dir).spawn();
+}
+
+/// Öffnet eine Adresse im Standardbrowser. Unter Windows über url.dll statt
+/// `cmd /c start`, weil cmd die `&` in der Adresse als Befehlstrenner liest.
+fn open_url(url: &str) {
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    let _ = command.arg(url).spawn();
 }
 
 /// "Reset in 2 Std. 5 Min. (14:30)", bei anderem Tag mit Wochentag.

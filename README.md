@@ -18,10 +18,10 @@ working. No logging out, no browser login, no restart of Claude Code.
   limits (e.g. Fable), with reset countdowns
 - **Works while Claude Code is running** (CLI and VS Code extension): the new
   account is picked up on the next prompt
+- **Log in per slot** without logging Claude Code out. Every login is
+  independent, so the same account can run on several PCs at the same time
 - **Never loses a login**: refuses to overwrite a login that is not stored in a
   slot, keeps a safety copy before every switch
-- **Export / import a slot via the clipboard**, e.g. to move an account to
-  another machine
 - **Single portable .exe** (~7.5 MB), no installer, no runtime
 
 ## Download
@@ -35,9 +35,12 @@ click *More info* → *Run anyway*.
 
 1. Make sure Claude Code is logged in with your **first** account.
    Click **Login übernehmen** ("take over login") on **Slot 1**.
-2. In Claude Code, run `/login` and sign in with your **second** account.
-   **Do not use `/logout`**: it revokes the token of the first account.
-3. Click **Login übernehmen** on **Slot 2**.
+2. Click **Neu einloggen** ("log in") on **Slot 2** and sign in with your
+   **second** account (see [Logging in to a slot](#logging-in-to-a-slot)).
+
+Alternatively, run `/login` in Claude Code for the second account and click
+**Login übernehmen** on Slot 2. **Do not use `/logout`**: it revokes the token
+of the first account.
 
 ## Usage
 
@@ -45,8 +48,7 @@ click *More info* → *Run anyway*.
 |---|---|
 | **Hierher wechseln** | Switch Claude Code to this slot |
 | **Login übernehmen** | Store the account Claude Code is currently logged in with in this slot |
-| **Zwischenablage → Exportieren** | Copy this slot's login to the clipboard |
-| **Zwischenablage → Importieren** | Put an exported login into this slot |
+| **Neu einloggen** | Log in to an account for this slot, independent of Claude Code |
 | **Aktualisieren** | Refresh usage now (at most every 20 s) |
 | **Ordner öffnen** | Open the folder where the slots are stored |
 
@@ -55,26 +57,26 @@ always live. The inactive account's access token expires after a few hours;
 from then on the window shows the last known values and the reset time. Once a
 reset has passed, the bar turns grey.
 
-### Moving an account via the clipboard
+### Logging in to a slot
 
-![Clipboard menu](docs/clipboard-menu.png)
+![Login window](docs/login.png)
 
-**Exportieren** copies the slot as a single line of text
-(`claude-slot:v1:…`). For the active slot, Claude Code's current token is taken
-first, so you never export an already used token. MCP and plugin logins stay on
-the machine.
+1. Click **Neu einloggen** on a slot.
+2. Click **Im Browser öffnen** and sign in with the account for this slot. If
+   your browser is already signed in to another Claude account, click
+   **Link kopieren** and open the link in a private window instead.
+3. After signing in, the page shows a code. Paste it into the window
+   (**Einfügen** or Ctrl+V) and click **Anmelden**.
 
-**Importieren** reads such a line from the clipboard. If the slot holds a
-different account, you are asked first. The clipboard is cleared after a
-successful import. Line breaks added by chat apps are ignored.
+This uses the same sign-in as Claude Code's own `/login`, but Claude Code
+stays logged in as it is. If the account you log in with is the one Claude
+Code is currently using, Claude Code switches to the new login as well.
 
-On Windows the exported text is excluded from clipboard history (Win+V) and
-cloud clipboard sync. It still contains the token: only share it over a
-channel you trust.
-
-> **A refresh token can only be used once.** If the same account is used on
-> two machines, the first token refresh on one machine invalidates the token on
-> the other. After moving an account, use it on one machine only.
+**Using one account on several PCs.** Log in separately on every PC (with
+**Neu einloggen** or `/login`). Each login has its own refresh token, so the
+PCs never get in each other's way. Do not copy a slot file to another PC: a
+refresh token can only be used once, so the first refresh on one PC would
+invalidate the copy on the other.
 
 ## How it works
 
@@ -107,6 +109,11 @@ Safety rules:
 - Before every switch, the previous login is copied to `last-live.json`.
 - Claude Slots never refreshes a token itself, so it cannot use one up.
 
+**Neu einloggen** runs the OAuth flow Claude Code uses for `/login` (PKCE, with
+the code shown on Anthropic's callback page), using Claude Code's public client
+ID, endpoints and scopes as of Claude Code 2.1.300. It then reads the account
+profile and stores token and account in exactly the format Claude Code writes.
+
 ## Files
 
 Folder: `%LOCALAPPDATA%\claude-slots`
@@ -126,8 +133,7 @@ Tokens are stored in plain text, just like Claude Code's own
 claude-slots --status      show slots and the current login
 claude-slots --capture N   store the current login in slot N
 claude-slots --switch N    switch to slot N
-claude-slots --export N    copy slot N to the clipboard
-claude-slots --import N    put an exported slot from the clipboard into slot N
+claude-slots --login N     log in (prints the link, reads the code) and store in slot N
 claude-slots --usage       query usage of the current login
 ```
 
@@ -164,8 +170,8 @@ token in the macOS Keychain (service `Claude Code-credentials`) via the
 ## Disclaimer
 
 This is an unofficial tool, not affiliated with or endorsed by Anthropic. It
-relies on Claude Code's local file layout and an undocumented usage endpoint,
-both of which may change at any time. Check that your use complies with
+relies on Claude Code's local file layout, its sign-in parameters and an
+undocumented usage endpoint, all of which may change at any time. Check that your use complies with
 Anthropic's terms. Use at your own risk.
 
 ## License
