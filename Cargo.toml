@@ -1,0 +1,24 @@
+[package]
+name = "claude-slots"
+version = "0.1.0"
+edition = "2024"
+description = "Switch Claude Code between two accounts with one click, with usage display"
+license = "MIT"
+repository = "https://github.com/mashen456/claude-account-switcher"
+
+[dependencies]
+anyhow = "1"
+arboard = { version = "3", default-features = false }
+base64 = "0.23"
+chrono = "0.4"
+dirs = "7"
+# OpenGL statt des standardmäßigen wgpu: deutlich kleinere exe, läuft auch auf macOS.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
