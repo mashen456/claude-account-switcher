@@ -17,20 +17,25 @@ pub fn read_opt(path: &Path) -> Result<Option<String>> {
             None => text,
         })),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("{} ist nicht lesbar", path.display())),
+        Err(e) => {
+            let shown = path.display();
+            Err(e).with_context(|| tr!("{shown} ist nicht lesbar", "Cannot read {shown}"))
+        }
     }
 }
 
 /// Schreibt erst eine Temp-Datei im selben Ordner und ersetzt dann das Ziel.
 /// So liest Claude Code nie eine halb geschriebene Datei.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let dir = path.parent().context("Pfad ohne Ordner")?;
-    fs::create_dir_all(dir).with_context(|| format!("{} nicht anlegbar", dir.display()))?;
-    let name = path.file_name().context("Pfad ohne Dateinamen")?.to_string_lossy();
+    let dir = path.parent().context("path without folder")?;
+    let shown = dir.display();
+    fs::create_dir_all(dir).with_context(|| tr!("{shown} nicht anlegbar", "Cannot create {shown}"))?;
+    let name = path.file_name().context("path without file name")?.to_string_lossy();
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     {
+        let shown = tmp.display();
         let mut file = fs::File::create(&tmp)
-            .with_context(|| format!("{} nicht anlegbar", tmp.display()))?;
+            .with_context(|| tr!("{shown} nicht anlegbar", "Cannot create {shown}"))?;
         file.write_all(data)?;
         file.sync_all()?;
     }
@@ -53,8 +58,9 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         }
     }
     let _ = fs::remove_file(&tmp);
-    let err = last_err.expect("mindestens ein Versuch");
-    Err(err).with_context(|| format!("{} konnte nicht ersetzt werden", path.display()))
+    let err = last_err.expect("at least one attempt");
+    let shown = path.display();
+    Err(err).with_context(|| tr!("{shown} konnte nicht ersetzt werden", "Cannot replace {shown}"))
 }
 
 #[cfg(unix)]

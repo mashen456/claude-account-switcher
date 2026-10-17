@@ -68,7 +68,7 @@ impl PendingLogin {
         let access = token
             .get("access_token")
             .and_then(Value::as_str)
-            .context("Antwort ohne Access-Token")?;
+            .with_context(no_access_token)?;
         // Ohne Profil fehlen nur Anzeigefelder; Claude Code lädt es später selbst nach.
         let profile = fetch_profile(access).ok();
         build_slot(&token, profile.as_ref(), chrono::Utc::now().timestamp_millis())
@@ -88,21 +88,37 @@ impl PendingLogin {
             .header("Content-Type", "application/json")
             .header("User-Agent", usage::USER_AGENT)
             .send(body.to_string())
-            .map_err(|e| anyhow!("Keine Verbindung zum Anmeldeserver: {e}"))?;
+            .map_err(|e| {
+                anyhow!(tr!(
+                    "Keine Verbindung zum Anmeldeserver: {e}",
+                    "Cannot reach the sign-in server: {e}"
+                ))
+            })?;
         let status = response.status().as_u16();
         let text = response.body_mut().read_to_string().unwrap_or_default();
         if status != 200 {
             let detail = error_detail(&text);
             if detail.contains("invalid_grant") {
-                bail!(
+                bail!(tr!(
                     "Der Code ist ungültig, abgelaufen oder schon benutzt. \
-                     Link neu öffnen und den neuen Code einfügen."
-                );
+                     Link neu öffnen und den neuen Code einfügen.",
+                    "The code is invalid, expired or already used. \
+                     Open the link again and paste the new code."
+                ));
             }
-            bail!("Anmeldung fehlgeschlagen (HTTP {status}): {detail}");
+            bail!(tr!(
+                "Anmeldung fehlgeschlagen (HTTP {status}): {detail}",
+                "Sign-in failed (HTTP {status}): {detail}"
+            ));
         }
-        serde_json::from_str(&text).context("Unerwartete Antwort vom Anmeldeserver")
+        serde_json::from_str(&text).with_context(|| {
+            tr!("Unerwartete Antwort vom Anmeldeserver", "Unexpected response from the sign-in server")
+        })
     }
+}
+
+fn no_access_token() -> String {
+    tr!("Antwort ohne Access-Token", "Response without access token")
 }
 
 fn fetch_profile(access_token: &str) -> Result<Value> {
@@ -112,8 +128,9 @@ fn fetch_profile(access_token: &str) -> Result<Value> {
         .header("anthropic-beta", usage::OAUTH_BETA)
         .header("User-Agent", usage::USER_AGENT)
         .call()?;
-    if response.status().as_u16() != 200 {
-        bail!("Profil nicht abrufbar (HTTP {})", response.status().as_u16());
+    let status = response.status().as_u16();
+    if status != 200 {
+        bail!(tr!("Profil nicht abrufbar (HTTP {status})", "Cannot load profile (HTTP {status})"));
     }
     Ok(serde_json::from_str(&response.body_mut().read_to_string()?)?)
 }
@@ -121,8 +138,9 @@ fn fetch_profile(access_token: &str) -> Result<Value> {
 /// Token-Objekt und `oauthAccount` so, wie Claude Code sie nach `/login` ablegt.
 fn build_slot(token: &Value, profile: Option<&Value>, now_ms: i64) -> Result<Slot> {
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
-    let access = text(token, "access_token").context("Antwort ohne Access-Token")?;
-    let refresh = text(token, "refresh_token").context("Antwort ohne Refresh-Token")?;
+    let access = text(token, "access_token").with_context(no_access_token)?;
+    let refresh = text(token, "refresh_token")
+        .with_context(|| tr!("Antwort ohne Refresh-Token", "Response without refresh token"))?;
     let expires_in = token.get("expires_in").and_then(Value::as_i64).unwrap_or(8 * 3600);
     let scopes: Vec<&str> = token
         .get("scope")
@@ -159,7 +177,7 @@ fn build_slot(token: &Value, profile: Option<&Value>, now_ms: i64) -> Result<Slo
     let email = text(account, "email").or_else(|| text(token_account, "email_address"));
     let org_uuid = text(org, "uuid").or_else(|| text(token_org, "uuid"));
     if account_uuid.is_none() && email.is_none() {
-        bail!("Die Anmeldung hat keinen Account geliefert");
+        bail!(tr!("Die Anmeldung hat keinen Account geliefert", "The sign-in returned no account"));
     }
 
     let mut credentials = Map::new();
@@ -204,7 +222,7 @@ fn build_slot(token: &Value, profile: Option<&Value>, now_ms: i64) -> Result<Slo
 fn parse_code(pasted: &str, expected_state: &str) -> Result<String> {
     let text = pasted.trim();
     if text.is_empty() {
-        bail!("Bitte den Code einfügen");
+        bail!(tr!("Bitte den Code einfügen", "Please paste the code"));
     }
     let (code, state) = if text.starts_with("http") {
         let query = text.split_once('?').map(|(_, q)| q).unwrap_or_default();
@@ -217,20 +235,28 @@ fn parse_code(pasted: &str, expected_state: &str) -> Result<String> {
                 state = Some(decode(value));
             }
         }
-        (code.context("In der eingefügten Adresse steht kein Code")?, state)
+        let code = code.with_context(|| {
+            tr!("In der eingefügten Adresse steht kein Code", "The pasted address contains no code")
+        })?;
+        (code, state)
     } else if let Some((code, state)) = text.split_once('#') {
         (code.to_string(), Some(state.to_string()))
     } else {
         (text.to_string(), None)
     };
     if state.is_some_and(|state| state != expected_state) {
-        bail!(
+        bail!(tr!(
             "Der Code gehört zu einem anderen Login-Versuch. \
-             Den Link aus diesem Fenster öffnen und erneut anmelden."
-        );
+             Den Link aus diesem Fenster öffnen und erneut anmelden.",
+            "The code belongs to a different sign-in attempt. \
+             Open the link from this window and sign in again."
+        ));
     }
     if code.is_empty() || code.contains(char::is_whitespace) {
-        bail!("Das sieht nicht nach dem Code von der Anmeldeseite aus");
+        bail!(tr!(
+            "Das sieht nicht nach dem Code von der Anmeldeseite aus",
+            "That does not look like the code from the sign-in page"
+        ));
     }
     Ok(code)
 }
@@ -250,7 +276,8 @@ fn error_detail(body: &str) -> String {
 
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow!("Zufallswerte nicht verfügbar: {e}"))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|e| anyhow!(tr!("Zufallswerte nicht verfügbar: {e}", "No random numbers available: {e}")))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 

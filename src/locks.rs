@@ -39,7 +39,8 @@ impl DirLock {
                 Ok(()) => return Ok(DirLock { path }),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
                 Err(e) => {
-                    return Err(e).with_context(|| format!("{} nicht anlegbar", path.display()));
+                    let shown = path.display();
+                    return Err(e).with_context(|| tr!("{shown} nicht anlegbar", "Cannot create {shown}"));
                 }
             }
             let stale = fs::metadata(&path)
@@ -52,11 +53,13 @@ impl DirLock {
                 continue;
             }
             if start.elapsed() > TIMEOUT {
-                bail!(
-                    "{} ist belegt, Claude Code erneuert vermutlich gerade das Token. \
+                let shown = path.display();
+                bail!(tr!(
+                    "{shown} ist belegt, Claude Code erneuert vermutlich gerade das Token. \
                      Gleich nochmal versuchen.",
-                    path.display()
-                );
+                    "{shown} is locked, Claude Code is probably refreshing its token. \
+                     Try again in a moment."
+                ));
             }
             sleep(Duration::from_millis(250));
         }

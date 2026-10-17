@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use crate::fsx;
 
 fn home() -> Result<PathBuf> {
-    dirs::home_dir().ok_or_else(|| anyhow!("Benutzerordner nicht gefunden"))
+    dirs::home_dir().ok_or_else(|| anyhow!(tr!("Benutzerordner nicht gefunden", "Home folder not found")))
 }
 
 fn config_dir_env() -> Option<PathBuf> {
@@ -57,8 +57,9 @@ pub fn oauth_account() -> Result<Option<Value>> {
     let Some(text) = fsx::read_opt(&path)? else {
         return Ok(None);
     };
+    let shown = path.display();
     let config: Value = serde_json::from_str(&text)
-        .with_context(|| format!("{} ist kein gültiges JSON", path.display()))?;
+        .with_context(|| tr!("{shown} ist kein gültiges JSON", "{shown} is not valid JSON"))?;
     Ok(config.get("oauthAccount").filter(|v| v.is_object()).cloned())
 }
 
@@ -68,7 +69,8 @@ pub fn set_oauth_account(oauth_account: &Value) -> Result<()> {
     let path = global_config_path()?;
     let mut config = match fsx::read_opt(&path)? {
         Some(text) => serde_json::from_str::<Map<String, Value>>(&text).with_context(|| {
-            format!("{} ist kein gültiges JSON, nicht angefasst", path.display())
+            let shown = path.display();
+            tr!("{shown} ist kein gültiges JSON, nicht angefasst", "{shown} is not valid JSON, left untouched")
         })?,
         None => Map::new(),
     };

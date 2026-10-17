@@ -7,13 +7,17 @@ use anyhow::{Context, Result};
 use arboard::{Clipboard, Error};
 
 pub fn set(text: &str) -> Result<()> {
-    retry(|clipboard| clipboard.set_text(text)).context("Zwischenablage nicht beschreibbar")
+    retry(|clipboard| clipboard.set_text(text))
+        .with_context(|| tr!("Zwischenablage nicht beschreibbar", "Cannot write to the clipboard"))
 }
 
 pub fn get() -> Result<String> {
     retry(|clipboard| clipboard.get_text()).map_err(|err| match err {
-        Error::ContentNotAvailable => anyhow::anyhow!("Die Zwischenablage enthält keinen Text"),
-        err => anyhow::Error::new(err).context("Zwischenablage nicht lesbar"),
+        Error::ContentNotAvailable => {
+            anyhow::anyhow!(tr!("Die Zwischenablage enthält keinen Text", "The clipboard holds no text"))
+        }
+        err => anyhow::Error::new(err)
+            .context(tr!("Zwischenablage nicht lesbar", "Cannot read the clipboard")),
     })
 }
 
