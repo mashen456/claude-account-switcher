@@ -133,6 +133,22 @@ removes the variables again and restores any values they had before (kept in
 `endpoint-backup.json` meanwhile); other settings and other variables in `env`
 stay as they are. Restart Claude Code after switching back as well.
 
+**Runpod endpoints** (address `https://<ENDPOINT_ID>.api.runpod.ai`) get extra
+lines in their card:
+
+- **Worker status** (off, starting, running, waiting for a GPU), read every
+  30 seconds from `https://api.runpod.ai/v2/<ENDPOINT_ID>/health` with the
+  slot's token. This asks Runpod only and never starts a worker.
+- **Tokens today and in total** (input and output) plus the **speed** of the
+  current worker, read from llama.cpp's `/metrics` (start `llama-server` with
+  `--metrics`). This request goes to the worker itself, so it is only made
+  while a worker is running, every minute while tokens keep coming in, and it
+  stops after 4 quiet minutes so the worker can shut down after its idle
+  timeout. **Refresh** queries once more.
+- llama.cpp's counters start at zero with every new worker; Claude Slots keeps
+  running totals in `runpod-stats.json`. Tokens a worker processes after the
+  last query before it shuts down are missing, so the totals are lower bounds.
+
 Notes:
 
 - No usage bars for endpoints, the usage display only exists for Claude
@@ -195,6 +211,7 @@ Folder: `%LOCALAPPDATA%\claude-slots` on Windows,
 | `usage-cache.json` | Last known usage and query schedule per account |
 | `last-live.json` | Safety copy taken before the last switch |
 | `endpoint-backup.json` | Previous `env` values while an endpoint is active |
+| `runpod-stats.json` | Token totals per Runpod endpoint |
 
 Tokens (and endpoint tokens) are stored in plain text, just like Claude Code's
 own `.credentials.json` on Windows. The files are readable only by your user on

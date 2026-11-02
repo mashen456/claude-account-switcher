@@ -12,6 +12,7 @@ mod endpoint;
 mod fsx;
 mod locks;
 mod login;
+mod runpod;
 mod settings;
 mod slots;
 mod store;

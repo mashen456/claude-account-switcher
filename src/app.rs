@@ -13,6 +13,7 @@ use crate::clipboard;
 use crate::endpoint::Endpoint;
 use crate::i18n::{self, Lang};
 use crate::login::PendingLogin;
+use crate::runpod::{self, Metrics, Schedule, StatsFile, Workers};
 use crate::slots::{self, Live, MAX_SLOTS, Slot, SlotStore};
 use crate::usage::{self, FetchError, Usage, UsageCache, Window};
 
@@ -37,6 +38,26 @@ enum Msg {
         slot: usize,
         result: anyhow::Result<Slot>,
     },
+    RunpodHealth {
+        id: String,
+        result: Result<Workers, FetchError>,
+    },
+    RunpodMetrics {
+        id: String,
+        result: Result<Metrics, FetchError>,
+    },
+}
+
+/// Status eines Runpod-Endpoints (siehe `runpod.rs`).
+#[derive(Default)]
+struct RunpodState {
+    schedule: Schedule,
+    workers: Option<Workers>,
+    metrics: Option<Metrics>,
+    health_error: Option<String>,
+    metrics_error: Option<String>,
+    health_loading: bool,
+    metrics_loading: bool,
 }
 
 /// Das Fenster "Neu einloggen".
@@ -146,12 +167,17 @@ pub struct App {
     last_check: Option<Instant>,
     /// Beim nächsten Durchlauf nachsehen; `true` = über "Aktualisieren".
     check_requested: Option<bool>,
+    runpod: HashMap<String, RunpodState>,
+    runpod_stats: Option<StatsFile>,
+    /// "Aktualisieren" gedrückt: Runpod-Zähler einmal sofort abfragen.
+    runpod_manual: bool,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let store = SlotStore::open().map_err(|e| format!("{e:#}"));
         let cache = store.as_ref().ok().map(|s| UsageCache::load(s.dir()));
+        let runpod_stats = store.as_ref().ok().map(|s| StatsFile::load(s.dir()));
         let (tx, rx) = channel();
         Self {
             store,
@@ -170,6 +196,9 @@ impl App {
             last_reload: None,
             last_check: None,
             check_requested: None,
+            runpod: HashMap::new(),
+            runpod_stats,
+            runpod_manual: false,
         }
     }
 
@@ -283,6 +312,131 @@ impl App {
         }
     }
 
+    /// Runpod-Endpoints: Worker-Status immer (kostenlos), Token-Zähler nur bei
+    /// laufendem Worker und solange gearbeitet wird.
+    fn poll_runpod(&mut self, ctx: &egui::Context) {
+        let manual = std::mem::take(&mut self.runpod_manual);
+        if std::env::var_os("CLAUDE_SLOTS_NO_FETCH").is_some_and(|v| !v.is_empty()) {
+            return;
+        }
+        let now = Instant::now();
+        let endpoints: Vec<_> = self
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| slot.endpoint.clone())
+            .filter_map(|ep| runpod::endpoint_id(&ep.base_url).map(|id| (id, ep)))
+            .collect();
+        for (id, ep) in endpoints {
+            let state = self.runpod.entry(id.clone()).or_default();
+            if !state.health_loading && (manual || state.schedule.health_due(now)) {
+                state.health_loading = true;
+                state.schedule.health_started(now);
+                let (tx, ctx, id, token) = (self.tx.clone(), ctx.clone(), id.clone(), ep.auth_token.clone());
+                std::thread::spawn(move || {
+                    let result = runpod::fetch_health(&id, &token);
+                    let _ = tx.send(Msg::RunpodHealth { id, result });
+                    ctx.request_repaint();
+                });
+            }
+            if !state.metrics_loading && state.schedule.metrics_due(now, manual) {
+                state.metrics_loading = true;
+                state.schedule.metrics_started(now, manual);
+                let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                let (url, token) = (ep.base_url.clone(), ep.auth_token.clone());
+                std::thread::spawn(move || {
+                    let result = runpod::fetch_metrics(&url, &token);
+                    let _ = tx.send(Msg::RunpodMetrics { id, result });
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
+    /// Worker-Status und Tokens unter einem Runpod-Endpoint.
+    fn runpod_rows(&self, ui: &mut egui::Ui, id: &str) {
+        let state = self.runpod.get(id);
+        let workers = state.and_then(|s| s.workers);
+        let metrics = state.and_then(|s| s.metrics);
+        let (worker_text, color) = match workers {
+            None => (tr!("Worker: Status unbekannt", "Worker: status unknown"), GRAY),
+            Some(w) if w.initializing > 0 => (tr!("Worker startet …", "Worker starting …"), AMBER),
+            Some(w) if w.up() => {
+                let busy = metrics.map_or(0.0, |m| m.processing);
+                if busy > 0.0 {
+                    let n = busy as u64;
+                    (tr!("Worker läuft · {n} Anfrage(n) in Arbeit", "Worker running · {n} request(s) in progress"), GREEN)
+                } else {
+                    (tr!("Worker läuft (kostet, bis er abschaltet)", "Worker running (billed until it shuts down)"), GREEN)
+                }
+            }
+            Some(w) if w.throttled > 0 => (tr!("Worker wartet auf eine freie GPU", "Worker waiting for a free GPU"), AMBER),
+            Some(_) => (tr!("Worker aus (startet beim nächsten Aufruf)", "Worker off (starts on the next request)"), GRAY),
+        };
+        ui.label(RichText::new(worker_text).small().color(color));
+
+        let totals = self
+            .runpod_stats
+            .as_ref()
+            .and_then(|stats| stats.entries.get(id));
+        if let Some(totals) = totals {
+            let (day_in, day_out) = totals.today(&runpod::today());
+            let (day_in, day_out) = (runpod::format_tokens(day_in), runpod::format_tokens(day_out));
+            let (all_in, all_out) = (
+                runpod::format_tokens(totals.prompt_tokens),
+                runpod::format_tokens(totals.predicted_tokens),
+            );
+            egui::Grid::new(("runpod", id))
+                .num_columns(3)
+                .spacing([10.0, 2.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("").small());
+                    ui.label(RichText::new(tr!("eingelesen", "input")).small().weak());
+                    ui.label(RichText::new(tr!("erzeugt", "output")).small().weak());
+                    ui.end_row();
+                    ui.label(RichText::new(tr!("Heute", "Today")).small());
+                    ui.label(RichText::new(day_in).small());
+                    ui.label(RichText::new(day_out).small());
+                    ui.end_row();
+                    ui.label(RichText::new(tr!("Insgesamt", "Total")).small());
+                    ui.label(RichText::new(all_in).small());
+                    ui.label(RichText::new(all_out).small());
+                    ui.end_row();
+                });
+        }
+        if let Some(m) = metrics.filter(|_| workers.is_some_and(|w| w.up())) {
+            if let (Some(p), Some(g)) = (m.prompt_rate(), m.predicted_rate()) {
+                let (p, g) = (p.round() as u64, g.round() as u64);
+                let (p, g) = (runpod::format_tokens(p), runpod::format_tokens(g));
+                ui.label(
+                    RichText::new(tr!(
+                        "Tempo dieses Workers: Einlesen {p} Tok/s · Antwort {g} Tok/s",
+                        "Speed of this worker: input {p} tok/s · output {g} tok/s"
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+        let paused = state.is_some_and(|s| s.schedule.paused) && workers.is_some_and(|w| w.up());
+        if paused {
+            ui.label(
+                RichText::new(tr!(
+                    "Token-Abfrage pausiert, damit der Worker abschalten kann. \
+                     \"Aktualisieren\" fragt einmal neu.",
+                    "Token queries paused so the worker can shut down. \
+                     \"Refresh\" queries once."
+                ))
+                .small()
+                .weak(),
+            );
+        }
+        let error = state.and_then(|s| s.health_error.as_ref().or(s.metrics_error.as_ref()));
+        if let Some(err) = error {
+            ui.label(RichText::new(format!("Runpod: {err}")).small().color(AMBER));
+        }
+    }
+
     fn receive(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -295,6 +449,40 @@ impl App {
                     state.note = result.err().map(Note::Failed);
                 }
                 Msg::Login { slot, result } => self.login_finished(slot, result),
+                Msg::RunpodHealth { id, result } => {
+                    let state = self.runpod.entry(id).or_default();
+                    state.health_loading = false;
+                    match result {
+                        Ok(workers) => {
+                            state.schedule.health_result(&workers);
+                            state.workers = Some(workers);
+                            state.health_error = None;
+                        }
+                        Err(err) => state.health_error = Some(err.to_string()),
+                    }
+                }
+                Msg::RunpodMetrics { id, result } => {
+                    let state = self.runpod.entry(id.clone()).or_default();
+                    state.metrics_loading = false;
+                    match result {
+                        Ok(metrics) => {
+                            let new_worker = state.schedule.take_new_worker();
+                            let grew = self
+                                .runpod_stats
+                                .as_mut()
+                                .is_some_and(|stats| stats.record(&id, &metrics, new_worker));
+                            let busy = grew || metrics.processing > 0.0 || metrics.deferred > 0.0;
+                            state.schedule.metrics_result(Instant::now(), busy);
+                            state.metrics = Some(metrics);
+                            state.metrics_error = None;
+                        }
+                        Err(err) => {
+                            // Fehler (z. B. Worker gerade weg) zählen als Ruhe.
+                            state.schedule.metrics_result(Instant::now(), false);
+                            state.metrics_error = Some(err.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -370,7 +558,10 @@ impl App {
         // aktiven Account). `Some(true)` = "Aktualisieren", nur 3 Minuten Abstand.
         let mut check = Some(false);
         match action {
-            Action::Refresh => check = Some(true),
+            Action::Refresh => {
+                check = Some(true);
+                self.runpod_manual = true;
+            }
             Action::Switch(n) => {
                 let result = self.store().and_then(|store| slots::switch_to(store, n));
                 self.status = Some(match result {
@@ -565,6 +756,10 @@ impl App {
                     ui.label(RichText::new(&endpoint.base_url).small().weak());
                     let model = &endpoint.model;
                     ui.label(RichText::new(tr!("Modell: {model}", "Model: {model}")).small().weak());
+                    if let Some(id) = runpod::endpoint_id(&endpoint.base_url) {
+                        ui.add_space(4.0);
+                        self.runpod_rows(ui, &id);
+                    }
                 } else {
                     match slot.and_then(|s| s.identity().map(|id| (s, id))) {
                         None => {
@@ -1037,6 +1232,7 @@ impl eframe::App for App {
         } else if self.last_check.is_none_or(|t| t.elapsed() >= CHECK_EVERY) {
             self.poll_usage(ctx, false);
         }
+        self.poll_runpod(ctx);
         ctx.request_repaint_after(Duration::from_secs(2));
     }
 
