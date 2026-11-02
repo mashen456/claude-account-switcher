@@ -1,8 +1,8 @@
 [package]
 name = "claude-slots"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-description = "Switch Claude Code between several accounts with one click, with usage display"
+description = "Switch Claude Code between several accounts and custom endpoints with one click, with usage display"
 license = "MIT"
 repository = "https://github.com/mashen456/claude-account-switcher"
 

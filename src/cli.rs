@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::endpoint::Endpoint;
 use crate::i18n::{self, Lang};
 use crate::login::PendingLogin;
 use crate::slots::{self, SlotStore};
@@ -20,6 +21,9 @@ claude-slots --status         Slots und aktuellen Login anzeigen
 claude-slots --capture N      aktuellen Login in Slot N speichern
 claude-slots --switch N       zu Slot N wechseln
 claude-slots --login N        mit einem Account einloggen und in Slot N speichern
+claude-slots --endpoint N URL MODELL [NAME]
+                              eigenen Endpoint (z. B. Runpod) in Slot N speichern,
+                              Token aus CLAUDE_SLOTS_ENDPOINT_TOKEN oder Eingabe
 claude-slots --add-slot       leeren Slot anhängen
 claude-slots --remove-slot N  Slot N entfernen
 claude-slots --lang de|en     Sprache einstellen
@@ -30,6 +34,9 @@ claude-slots --status         show slots and the current login
 claude-slots --capture N      store the current login in slot N
 claude-slots --switch N       switch to slot N
 claude-slots --login N        log in to an account and store it in slot N
+claude-slots --endpoint N URL MODEL [NAME]
+                              store a custom endpoint (e.g. Runpod) in slot N,
+                              token from CLAUDE_SLOTS_ENDPOINT_TOKEN or prompt
 claude-slots --add-slot       append an empty slot
 claude-slots --remove-slot N  remove slot N
 claude-slots --lang de|en     set the language
@@ -59,9 +66,17 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         [cmd, n] if cmd == "--switch" => {
             let n = slot_number(&store, n)?;
-            let email = slots::switch_to(&store, n)?.email;
-            println!("{}", tr!("Gewechselt zu Slot {n} ({email})", "Switched to slot {n} ({email})"));
+            let switched = slots::switch_to(&store, n)?;
+            let label = switched.label;
+            println!("{}", tr!("Gewechselt zu Slot {n} ({label})", "Switched to slot {n} ({label})"));
+            if switched.restart_needed {
+                println!("{}", restart_hint());
+            }
             Ok(())
+        }
+        [cmd, n, url, model, name @ ..] if cmd == "--endpoint" && name.len() <= 1 => {
+            let n = slot_number(&store, n)?;
+            set_endpoint(&store, n, url, model, name.first().map(String::as_str))
         }
         [cmd, n] if cmd == "--login" => login(&store, slot_number(&store, n)?),
         [cmd] if cmd == "--add-slot" => {
@@ -105,17 +120,64 @@ fn slot_number(store: &SlotStore, text: &str) -> Result<usize> {
     Ok(n)
 }
 
+pub fn restart_hint() -> String {
+    tr!(
+        "Laufende Claude-Code-Sitzungen neu starten, damit sie die Änderung übernehmen.",
+        "Restart running Claude Code sessions so they pick up the change."
+    )
+}
+
+fn set_endpoint(store: &SlotStore, n: usize, url: &str, model: &str, name: Option<&str>) -> Result<()> {
+    // Token nicht als Argument, sonst landet er in der Shell-History.
+    let token = match std::env::var("CLAUDE_SLOTS_ENDPOINT_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => token,
+        _ => {
+            eprint!("{}", tr!("Token (z. B. Runpod-API-Key): ", "Token (e.g. Runpod API key): "));
+            let mut token = String::new();
+            std::io::stdin().read_line(&mut token)?;
+            token
+        }
+    };
+    let endpoint = Endpoint {
+        name: name.unwrap_or_default().to_string(),
+        base_url: url.to_string(),
+        auth_token: token,
+        model: model.to_string(),
+    };
+    let reapplied = slots::save_endpoint(store, n, endpoint)?;
+    println!("{}", tr!("Endpoint in Slot {n} gespeichert", "Endpoint stored in slot {n}"));
+    if reapplied {
+        println!("{}", tr!("Er ist aktiv, settings.json wurde aktualisiert.", "It is active, settings.json was updated."));
+        println!("{}", restart_hint());
+    }
+    Ok(())
+}
+
 fn status(store: &SlotStore) -> Result<()> {
     let live = slots::read_live()?;
+    let active_endpoint = store.active_endpoint()?;
     match &live {
         Some(live) => println!("Claude Code: {}", live.identity.email),
         None => println!("Claude Code: {}", tr!("nicht eingeloggt", "not logged in")),
     }
+    let active_mark = format!("  [{}]", tr!("aktiv", "active"));
     for n in 1..=store.count() {
-        let id = store.load(n)?.and_then(|slot| slot.identity());
-        let active = matches!((&id, &live), (Some(id), Some(live)) if id.same_account(&live.identity));
+        let slot = store.load(n)?;
+        if let Some(endpoint) = slot.as_ref().and_then(|slot| slot.endpoint.as_ref()) {
+            let mark = if active_endpoint == Some(n) { active_mark.as_str() } else { "" };
+            println!(
+                "Slot {n}: Endpoint {} ({}, {}){mark}",
+                endpoint.display_name(),
+                endpoint.base_url,
+                endpoint.model
+            );
+            continue;
+        }
+        let id = slot.and_then(|slot| slot.identity());
+        let active = active_endpoint.is_none()
+            && matches!((&id, &live), (Some(id), Some(live)) if id.same_account(&live.identity));
         match id {
-            Some(id) if active => println!("Slot {n}: {}  [{}]", id.email, tr!("aktiv", "active")),
+            Some(id) if active => println!("Slot {n}: {}{active_mark}", id.email),
             Some(id) => println!("Slot {n}: {}", id.email),
             None => println!("Slot {n}: {}", tr!("leer", "empty")),
         }
@@ -139,6 +201,13 @@ fn login(store: &SlotStore, n: usize) -> Result<()> {
     let mut code = String::new();
     std::io::stdin().read_line(&mut code)?;
     let slot = login.finish(&code)?;
+    if let Some(endpoint) = store.load(n)?.and_then(|slot| slot.endpoint) {
+        let name = endpoint.display_name();
+        bail!(tr!(
+            "In Slot {n} liegt der Endpoint {name}; überschreiben nur über die Oberfläche",
+            "Slot {n} holds the endpoint {name}; overwrite it in the window"
+        ));
+    }
     let old = store.load(n)?.and_then(|slot| slot.identity());
     if let (Some(old), Some(new)) = (&old, &slot.identity()) {
         if !old.same_account(new) {

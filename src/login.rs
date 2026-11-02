@@ -210,11 +210,7 @@ fn build_slot(token: &Value, profile: Option<&Value>, now_ms: i64) -> Result<Slo
         put("profileFetchedAt", json!(now_ms));
     }
 
-    Ok(Slot {
-        credentials: Value::Object(credentials),
-        oauth_account: Value::Object(oauth_account),
-        saved_at: chrono::Local::now().to_rfc3339(),
-    })
+    Ok(Slot::account(Value::Object(credentials), Value::Object(oauth_account)))
 }
 
 /// Die Seite zeigt `code#state`. Akzeptiert auch nur den Code oder die ganze

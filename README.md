@@ -1,7 +1,9 @@
 # Claude Slots
 
 Switch Claude Code between several accounts with one click, and see how much
-of each account's usage limit is left.
+of each account's usage limit is left. A slot can also hold your own
+Anthropic-compatible endpoint, e.g. a model you run on Runpod. Runs on Windows
+and macOS.
 
 Made for people who run out of one plan and keep another account to continue
 working. No logging out, no browser login, no restart of Claude Code.
@@ -16,6 +18,9 @@ working. No logging out, no browser login, no restart of Claude Code.
   Add slots with **+ Add slot** (up to 10), remove them with **×**
 - **Usage per account**: 5-hour window, 7-day window and per-model weekly
   limits (e.g. Fable), with reset countdowns
+- **Endpoint slots**: point Claude Code at your own Anthropic-compatible
+  server (llama.cpp, a gateway, a model on Runpod) and back to your Claude
+  account with one click (see [Endpoint slots](#endpoint-slots))
 - **English and German**, switch with **DE / EN** at the bottom right
 - **Works while Claude Code is running** (CLI and VS Code extension): the new
   account is picked up on the next prompt
@@ -23,14 +28,20 @@ working. No logging out, no browser login, no restart of Claude Code.
   independent, so the same account can run on several PCs at the same time
 - **Never loses a login**: refuses to overwrite a login that is not stored in a
   slot, keeps a safety copy before every switch
-- **Single portable .exe** (~7.5 MB), no installer, no runtime
+- **Single portable .exe** (~7.5 MB) on Windows, a small **.app** on macOS,
+  no installer, no runtime
 
 ## Download
 
-Grab `claude-slots.exe` from the
-[latest release](https://github.com/mashen456/claude-account-switcher/releases/latest)
-and run it. Windows SmartScreen may warn because the file is not code-signed:
-click *More info* → *Run anyway*.
+From the [latest release](https://github.com/mashen456/claude-account-switcher/releases/latest):
+
+- **Windows**: `claude-slots.exe`, just run it. SmartScreen may warn because
+  the file is not code-signed: click *More info* → *Run anyway*.
+- **macOS** (Apple Silicon and Intel, macOS 11 or newer): unzip
+  `claude-slots-macos.zip` and move **Claude Slots** to *Applications*. The app
+  is not notarized, so the first start needs a right-click on the app → *Open*
+  → *Open*. If macOS still says the app is damaged, run
+  `xattr -dr com.apple.quarantine "/Applications/Claude Slots.app"` once.
 
 ## Setup (once)
 
@@ -52,10 +63,11 @@ of the account you are leaving.
 | **Take over login** | Store the account Claude Code is currently logged in with in this slot |
 | **Log in** | Log in to an account for this slot, independent of Claude Code |
 | **×** | Remove the slot (asks first if it holds a login). The active slot and the last slot cannot be removed; the following slots move up |
+| **Set up endpoint** / **Edit** | Store your own endpoint in an empty slot, or change it |
 | **+ Add slot** | Append an empty slot (up to 10) |
 | **Refresh** | Query usage now (at most every 3 minutes per account) |
 | **Open folder** | Open the folder where the slots are stored |
-| **DE / EN** | Switch the language. On first start it follows the Windows language |
+| **DE / EN** | Switch the language. On first start it follows the system language |
 
 **Usage display.** The usage endpoint allows only about 30 requests per hour
 per account, and a burst can lock an account out for up to an hour. Claude
@@ -90,14 +102,57 @@ PCs never get in each other's way. Do not copy a slot file to another PC: a
 refresh token can only be used once, so the first refresh on one PC would
 invalidate the copy on the other.
 
+### Endpoint slots
+
+An endpoint slot makes Claude Code talk to your own server instead of
+Anthropic, for example Qwen3-Coder running with llama.cpp on a Runpod
+load-balancing endpoint. The server must speak the Anthropic Messages API
+(`/v1/messages`); llama.cpp's `llama-server` does.
+
+1. Click **Set up endpoint** on an empty slot (add one with **+ Add slot**).
+2. Fill in
+   - **Address**: the base URL without `/v1`, for Runpod
+     `https://<ENDPOINT_ID>.api.runpod.ai`
+   - **Token**: sent as `Authorization: Bearer …`, for Runpod your Runpod API key
+   - **Model**: the model name the server expects (llama.cpp: its `--alias`)
+3. Click **Switch here**, then **restart Claude Code**. Claude Code reads these
+   settings only at startup.
+
+Switching to an endpoint writes these variables to the `env` block of
+`~/.claude/settings.json`:
+
+| Variable | Value |
+|---|---|
+| `ANTHROPIC_BASE_URL` | Address |
+| `ANTHROPIC_AUTH_TOKEN` | Token |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Model, so subagents and background tasks use it too |
+
+`ANTHROPIC_AUTH_TOKEN` takes precedence over the claude.ai login, so the
+login stays where it is and is not touched. **Switch here** on an account slot
+removes the variables again and restores any values they had before (kept in
+`endpoint-backup.json` meanwhile); other settings and other variables in `env`
+stay as they are. Restart Claude Code after switching back as well.
+
+Notes:
+
+- No usage bars for endpoints, the usage display only exists for Claude
+  accounts.
+- A scale-to-zero endpoint (Runpod serverless with 0 minimum workers) needs a
+  few minutes for the first request after a pause. Send one request (or open
+  the endpoint's `/ping` with your API key) before you start working.
+- An active endpoint cannot be removed or overwritten; switch to another slot
+  first.
+- Features that need a claude.ai login (claude.ai connectors, `/schedule`)
+  are not available while an endpoint is active.
+
 ## How it works
 
 A slot is a copy of what Claude Code stores after `/login`:
 
-| What | Where |
-|---|---|
-| Token | `%USERPROFILE%\.claude\.credentials.json` |
-| Account | `oauthAccount` block in `%USERPROFILE%\.claude.json` |
+| What | Windows | macOS |
+|---|---|---|
+| Token | `%USERPROFILE%\.claude\.credentials.json` | Keychain item `Claude Code-credentials` (fallback: `~/.claude/.credentials.json`) |
+| Account | `oauthAccount` block in `%USERPROFILE%\.claude.json` | `oauthAccount` block in `~/.claude.json` |
 
 When switching, Claude Slots:
 
@@ -107,7 +162,9 @@ When switching, Claude Slots:
 2. **Writes the current token back into the outgoing account's slot.** Claude
    Code rotates the refresh token regularly and each one works only once.
    Without this step the slot would hold a used-up token.
-3. Writes the target slot's token to `.credentials.json`. MCP and plugin logins
+3. Writes the target slot's token to `.credentials.json` (macOS: to the
+   Keychain via `/usr/bin/security`, the same way Claude Code does, plus the
+   fallback file if it exists). MCP and plugin logins
    (`mcpOAuth` etc.) keep their current state.
 4. Replaces only `oauthAccount` in `.claude.json`. Projects, MCP servers and
    settings stay untouched.
@@ -128,7 +185,8 @@ profile and stores token and account in exactly the format Claude Code writes.
 
 ## Files
 
-Folder: `%LOCALAPPDATA%\claude-slots`
+Folder: `%LOCALAPPDATA%\claude-slots` on Windows,
+`~/Library/Application Support/claude-slots` on macOS
 
 | File | Content |
 |---|---|
@@ -136,9 +194,11 @@ Folder: `%LOCALAPPDATA%\claude-slots`
 | `settings.json` | Number of slots and language |
 | `usage-cache.json` | Last known usage and query schedule per account |
 | `last-live.json` | Safety copy taken before the last switch |
+| `endpoint-backup.json` | Previous `env` values while an endpoint is active |
 
-Tokens are stored in plain text, just like Claude Code's own
-`.credentials.json`.
+Tokens (and endpoint tokens) are stored in plain text, just like Claude Code's
+own `.credentials.json` on Windows. The files are readable only by your user on
+macOS.
 
 ## Command line
 
@@ -147,15 +207,21 @@ claude-slots --status         show slots and the current login
 claude-slots --capture N      store the current login in slot N
 claude-slots --switch N       switch to slot N
 claude-slots --login N        log in (prints the link, reads the code) and store in slot N
+claude-slots --endpoint N URL MODEL [NAME]
+                              store an endpoint in slot N; the token comes from
+                              CLAUDE_SLOTS_ENDPOINT_TOKEN or is asked for
 claude-slots --add-slot       append an empty slot
 claude-slots --remove-slot N  remove slot N
 claude-slots --lang de|en     set the language
 claude-slots --usage          query usage of the current login
 ```
 
-The release build has no console window, so text only shows up when output is
-redirected (`claude-slots --status | more`). Exit codes (0 = ok, 1 = error)
-always work, which makes it easy to bind `--switch` to a hotkey.
+On Windows the release build has no console window, so text only shows up when
+output is redirected (`claude-slots --status | more`). On macOS call the binary
+inside the app:
+`"/Applications/Claude Slots.app/Contents/MacOS/claude-slots" --status`.
+Exit codes (0 = ok, 1 = error) always work, which makes it easy to bind
+`--switch` to a hotkey.
 
 ## Building from source
 
@@ -165,23 +231,31 @@ Requires [Rust](https://rustup.rs/) 1.85 or newer.
 cargo build --release
 ```
 
-The binary ends up in `target\release\claude-slots.exe`.
+On Windows the binary ends up in `target\release\claude-slots.exe`. On a Mac,
+`scripts/macos-app.sh` builds a universal `Claude Slots.app` and a zip of it in
+`target/macos/` (needs the Xcode Command Line Tools). The GitHub workflow in
+`.github/workflows/build.yml` builds both and attaches them to a release when
+a `v*` tag is pushed.
 
 For testing without touching your real login, point these variables at
 scratch folders:
 
 | Variable | Effect |
 |---|---|
-| `CLAUDE_CONFIG_DIR` | Claude Code's config folder (also honoured by Claude Code itself) |
+| `CLAUDE_CONFIG_DIR` | Claude Code's config folder (also honoured by Claude Code itself; on macOS the Keychain item then gets a suffix derived from the path) |
 | `CLAUDE_SLOTS_DIR` | Where slots are stored |
 | `CLAUDE_SLOTS_NO_FETCH=1` | Don't query the usage API |
 
-## macOS
+## macOS notes
 
-Prepared but **not tested yet**: `src/store/keychain.rs` reads and writes the
-token in the macOS Keychain (service `Claude Code-credentials`) via the
-`security` tool, and slots live in `~/Library/Application Support/claude-slots`.
-`CLAUDE_CONFIG_DIR` is not supported on macOS yet.
+- The token lives in the Keychain. The first time Claude Slots reads it, macOS
+  may ask whether `security` may access the item: click **Always Allow**.
+- After a switch, a running Claude Code may keep the previous account until
+  its next token refresh or a restart. If it does, restart it.
+- The Keychain item name used with `CLAUDE_CONFIG_DIR` (`Claude
+  Code-credentials-` plus the first 8 hex characters of the SHA-256 of the
+  folder path) follows other tools that read the same item and has not been
+  verified against Claude Code yet.
 
 ## Disclaimer
 

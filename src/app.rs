@@ -10,6 +10,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::claude::{self, Identity};
 use crate::clipboard;
+use crate::endpoint::Endpoint;
 use crate::i18n::{self, Lang};
 use crate::login::PendingLogin;
 use crate::slots::{self, Live, MAX_SLOTS, Slot, SlotStore};
@@ -45,6 +46,14 @@ struct LoginDialog {
     code: String,
     busy: bool,
     copied: bool,
+    error: Option<String>,
+}
+
+/// Das Fenster "Endpoint einrichten" bzw. "bearbeiten".
+struct EndpointDialog {
+    slot: usize,
+    endpoint: Endpoint,
+    show_token: bool,
     error: Option<String>,
 }
 
@@ -102,6 +111,7 @@ enum Action {
     Switch(usize),
     Capture(usize),
     Login(usize),
+    EditEndpoint(usize),
     AddSlot,
     RemoveSlot(usize),
     SetLanguage(Lang),
@@ -113,7 +123,7 @@ enum Action {
 /// Wartet auf Bestätigung: Überschreiben eines anderen Accounts oder Entfernen.
 enum Pending {
     Capture(usize),
-    Login { slot: usize, data: Slot },
+    Login { slot: usize, data: Box<Slot> },
     Remove(usize),
 }
 
@@ -122,11 +132,14 @@ pub struct App {
     slots: Vec<Option<Slot>>,
     live: Option<Live>,
     live_error: Option<String>,
+    /// Endpoint-Slot, der gerade in Claude Codes settings.json steht.
+    active_endpoint: Option<usize>,
     cache: Option<UsageCache>,
     usage: HashMap<String, UsageState>,
     status: Option<Status>,
     pending: Option<Pending>,
     login: Option<LoginDialog>,
+    endpoint_dialog: Option<EndpointDialog>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     last_reload: Option<Instant>,
@@ -145,11 +158,13 @@ impl App {
             slots: Vec::new(),
             live: None,
             live_error: None,
+            active_endpoint: None,
             cache,
             usage: HashMap::new(),
             status: None,
             pending: None,
             login: None,
+            endpoint_dialog: None,
             tx,
             rx,
             last_reload: None,
@@ -190,9 +205,23 @@ impl App {
                 self.live_error = Some(format!("{err:#}"));
             }
         }
+        match store.active_endpoint() {
+            Ok(n) => self.active_endpoint = n,
+            Err(err) => {
+                self.active_endpoint = None;
+                self.status = Some(Status::error(err));
+            }
+        }
     }
 
+    /// Der Slot, den Claude Code gerade benutzt: ein aktiver Endpoint geht vor.
     fn active_slot(&self) -> Option<usize> {
+        self.active_endpoint.or_else(|| self.account_slot())
+    }
+
+    /// Der Slot mit dem Account, mit dem Claude Code eingeloggt ist (auch wenn
+    /// gerade ein Endpoint darüber liegt).
+    fn account_slot(&self) -> Option<usize> {
         let live = self.live.as_ref()?;
         (1..=self.slots.len()).find(|&n| {
             self.slot(n)
@@ -208,7 +237,7 @@ impl App {
         if std::env::var_os("CLAUDE_SLOTS_NO_FETCH").is_some_and(|v| !v.is_empty()) {
             return;
         }
-        let active = self.active_slot();
+        let active = self.account_slot();
         let Some(cache) = &mut self.cache else { return };
         for n in 1..=self.slots.len() {
             let Some(slot) = &self.slots[n - 1] else { continue };
@@ -281,7 +310,7 @@ impl App {
             Ok(data) => {
                 self.login = None;
                 if self.overwrites_other(slot, data.identity().as_ref()) {
-                    self.pending = Some(Pending::Login { slot, data });
+                    self.pending = Some(Pending::Login { slot, data: Box::new(data) });
                 } else {
                     self.status = Some(self.store_login(slot, data));
                     self.reload();
@@ -293,6 +322,9 @@ impl App {
 
     /// Würde Slot `n` mit einem anderen Account überschrieben? Dann erst nachfragen.
     fn overwrites_other(&self, n: usize, new: Option<&Identity>) -> bool {
+        if self.slot(n).is_some_and(|slot| slot.endpoint.is_some()) {
+            return true;
+        }
         match (self.slot(n).and_then(Slot::identity), new) {
             (Some(old), Some(new)) => !old.same_account(new),
             _ => false,
@@ -342,12 +374,21 @@ impl App {
             Action::Switch(n) => {
                 let result = self.store().and_then(|store| slots::switch_to(store, n));
                 self.status = Some(match result {
-                    Ok(id) => {
-                        let email = id.email;
+                    Ok(switched) if switched.restart_needed => {
+                        let label = switched.label;
                         Status::ok(tr!(
-                            "Gewechselt zu Slot {n} ({email}). Claude Code übernimmt den Account \
+                            "Gewechselt zu Slot {n} ({label}). Laufende Claude-Code-Sitzungen \
+                             neu starten, damit sie die Änderung übernehmen.",
+                            "Switched to slot {n} ({label}). Restart running Claude Code \
+                             sessions so they pick up the change."
+                        ))
+                    }
+                    Ok(switched) => {
+                        let label = switched.label;
+                        Status::ok(tr!(
+                            "Gewechselt zu Slot {n} ({label}). Claude Code übernimmt den Account \
                              beim nächsten Prompt.",
-                            "Switched to slot {n} ({email}). Claude Code picks up the account \
+                            "Switched to slot {n} ({label}). Claude Code picks up the account \
                              on the next prompt."
                         ))
                     }
@@ -375,6 +416,19 @@ impl App {
                     }
                     Err(err) => self.status = Some(Status::error(err)),
                 }
+                return;
+            }
+            Action::EditEndpoint(n) => {
+                let endpoint = self
+                    .slot(n)
+                    .and_then(|slot| slot.endpoint.clone())
+                    .unwrap_or_default();
+                self.endpoint_dialog = Some(EndpointDialog {
+                    slot: n,
+                    endpoint,
+                    show_token: false,
+                    error: None,
+                });
                 return;
             }
             Action::AddSlot => {
@@ -408,7 +462,7 @@ impl App {
             Action::Confirm => match self.pending.take() {
                 Some(Pending::Capture(n)) => self.status = Some(self.capture(n)),
                 Some(Pending::Login { slot, data }) => {
-                    self.status = Some(self.store_login(slot, data));
+                    self.status = Some(self.store_login(slot, *data));
                 }
                 Some(Pending::Remove(n)) => {
                     self.status = Some(self.remove_slot(n));
@@ -444,12 +498,15 @@ impl App {
                     ),
                 );
             }
-        } else {
+        } else if self.active_endpoint.is_none() {
             ui.colored_label(AMBER, tr!("Claude Code ist nicht eingeloggt.", "Claude Code is not logged in."));
         }
         ui.add_space(4.0);
+        let account = self.account_slot();
         for n in 1..=self.slots.len() {
-            self.slot_card(ui, n, active == Some(n), action);
+            // Eingeloggt, aber ein Endpoint liegt darüber.
+            let paused = self.active_endpoint.is_some() && account == Some(n);
+            self.slot_card(ui, n, active == Some(n), paused, action);
             ui.add_space(8.0);
         }
         let can_add = self.slots.len() < MAX_SLOTS;
@@ -462,7 +519,7 @@ impl App {
         }
     }
 
-    fn slot_card(&self, ui: &mut egui::Ui, n: usize, active: bool, action: &mut Option<Action>) {
+    fn slot_card(&self, ui: &mut egui::Ui, n: usize, active: bool, paused: bool, action: &mut Option<Action>) {
         let slot = self.slot(n);
         let count = self.slots.len();
         egui::Frame::group(ui.style())
@@ -499,29 +556,58 @@ impl App {
                         }
                     });
                 });
-                match slot.and_then(|s| s.identity().map(|id| (s, id))) {
-                    None => {
-                        ui.label(RichText::new(tr!("Leer", "Empty")).weak());
-                    }
-                    Some((slot, id)) => {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&id.email).strong());
-                            if let Some(plan) = claude::plan_label(&slot.credentials) {
-                                ui.label(RichText::new(plan).weak());
+                let endpoint = slot.and_then(|s| s.endpoint.as_ref());
+                if let Some(endpoint) = endpoint {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(endpoint.display_name()).strong());
+                        ui.label(RichText::new(tr!("Eigener Endpoint", "Custom endpoint")).weak());
+                    });
+                    ui.label(RichText::new(&endpoint.base_url).small().weak());
+                    let model = &endpoint.model;
+                    ui.label(RichText::new(tr!("Modell: {model}", "Model: {model}")).small().weak());
+                } else {
+                    match slot.and_then(|s| s.identity().map(|id| (s, id))) {
+                        None => {
+                            ui.label(RichText::new(tr!("Leer", "Empty")).weak());
+                        }
+                        Some((slot, id)) => {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&id.email).strong());
+                                if let Some(plan) = claude::plan_label(&slot.credentials) {
+                                    ui.label(RichText::new(plan).weak());
+                                }
+                            });
+                            if paused {
+                                ui.label(
+                                    RichText::new(tr!(
+                                        "Claude Code ist mit diesem Account eingeloggt, nutzt aber \
+                                         gerade den Endpoint.",
+                                        "Claude Code is logged in with this account but currently \
+                                         uses the endpoint."
+                                    ))
+                                    .small()
+                                    .color(AMBER),
+                                );
                             }
-                        });
-                        ui.add_space(4.0);
-                        self.usage_rows(ui, n, &id);
+                            ui.add_space(4.0);
+                            self.usage_rows(ui, n, &id);
+                        }
                     }
                 }
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let can_switch = slot.is_some() && !active;
+                ui.horizontal_wrapped(|ui| {
+                    let can_switch = (slot.is_some() && !active) || paused;
                     if ui
                         .add_enabled(can_switch, egui::Button::new(tr!("Hierher wechseln", "Switch here")))
                         .clicked()
                     {
                         *action = Some(Action::Switch(n));
+                    }
+                    if endpoint.is_some() {
+                        if ui.button(tr!("Bearbeiten", "Edit")).clicked() {
+                            *action = Some(Action::EditEndpoint(n));
+                        }
+                        return;
                     }
                     if ui
                         .button(tr!("Login übernehmen", "Take over login"))
@@ -545,6 +631,19 @@ impl App {
                         .clicked()
                     {
                         *action = Some(Action::Login(n));
+                    }
+                    if slot.is_none()
+                        && ui
+                            .button(tr!("Endpoint einrichten", "Set up endpoint"))
+                            .on_hover_text(tr!(
+                                "Eigener Anthropic-kompatibler Server statt eines Claude-Accounts, \
+                                 z. B. ein eigenes Modell auf Runpod.",
+                                "Your own Anthropic-compatible server instead of a Claude account, \
+                                 e.g. your own model on Runpod."
+                            ))
+                            .clicked()
+                    {
+                        *action = Some(Action::EditEndpoint(n));
                     }
                 });
             });
@@ -644,9 +743,11 @@ impl App {
         ui.label(
             RichText::new(tr!(
                 "Account einrichten: bei einem Slot \"Neu einloggen\", oder den aktuellen \
-                 Login von Claude Code mit \"Login übernehmen\" speichern.",
+                 Login von Claude Code mit \"Login übernehmen\" speichern. Eigenes Modell \
+                 (z. B. Runpod): bei einem leeren Slot \"Endpoint einrichten\".",
                 "Add an account: click \"Log in\" on a slot, or store Claude Code's \
-                 current login with \"Take over login\"."
+                 current login with \"Take over login\". Your own model (e.g. Runpod): \
+                 \"Set up endpoint\" on an empty slot."
             ))
             .small()
             .weak(),
@@ -753,14 +854,118 @@ impl App {
         }
     }
 
+    fn endpoint_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.endpoint_dialog else { return };
+        let (mut save, mut cancel) = (false, false);
+        let response = egui::Modal::new(egui::Id::unique("endpoint")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            let n = dialog.slot;
+            ui.heading(tr!("Slot {n}: eigener Endpoint", "Slot {n}: custom endpoint"));
+            ui.label(
+                RichText::new(tr!(
+                    "Ein Anthropic-kompatibler Server (/v1/messages), z. B. llama.cpp auf \
+                     Runpod. Claude Code nutzt ihn statt des Claude-Accounts, der Login \
+                     bleibt erhalten.",
+                    "An Anthropic-compatible server (/v1/messages), e.g. llama.cpp on \
+                     Runpod. Claude Code uses it instead of the Claude account; the login \
+                     is kept."
+                ))
+                .small()
+                .weak(),
+            );
+            ui.add_space(6.0);
+            let ep = &mut dialog.endpoint;
+            egui::Grid::new("endpoint-fields")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ep.name)
+                            .hint_text("Runpod Qwen3-Coder")
+                            .desired_width(280.0),
+                    );
+                    ui.end_row();
+                    ui.label(tr!("Adresse", "Address"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ep.base_url)
+                            .hint_text("https://<ENDPOINT_ID>.api.runpod.ai")
+                            .desired_width(280.0),
+                    );
+                    ui.end_row();
+                    ui.label("Token");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ep.auth_token)
+                                .password(!dialog.show_token)
+                                .hint_text(tr!("Runpod-API-Key", "Runpod API key"))
+                                .desired_width(200.0),
+                        );
+                        ui.checkbox(&mut dialog.show_token, tr!("zeigen", "show"));
+                    });
+                    ui.end_row();
+                    ui.label(tr!("Modell", "Model"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ep.model)
+                            .hint_text("qwen3-coder-next")
+                            .desired_width(280.0),
+                    );
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new(tr!(
+                    "Gespeichert wie die Account-Tokens: im Klartext im Slot-Ordner. \
+                     Beim Wechseln landen die Werte in ~/.claude/settings.json.",
+                    "Stored like the account tokens: in plain text in the slot folder. \
+                     Switching writes them to ~/.claude/settings.json."
+                ))
+                .small()
+                .weak(),
+            );
+            if let Some(err) = &dialog.error {
+                ui.colored_label(RED, err.as_str());
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                save = ui.button(tr!("Speichern", "Save")).clicked();
+                cancel = ui.button(tr!("Abbrechen", "Cancel")).clicked();
+            });
+        });
+        if save {
+            let (n, endpoint) = (dialog.slot, dialog.endpoint.clone());
+            let result = self.store().and_then(|store| slots::save_endpoint(store, n, endpoint));
+            match result {
+                Ok(reapplied) => {
+                    self.endpoint_dialog = None;
+                    self.status = Some(Status::ok(if reapplied {
+                        tr!(
+                            "Endpoint in Slot {n} gespeichert und neu eingetragen. Laufende \
+                             Claude-Code-Sitzungen neu starten.",
+                            "Endpoint in slot {n} saved and applied. Restart running Claude \
+                             Code sessions."
+                        )
+                    } else {
+                        tr!(
+                            "Endpoint in Slot {n} gespeichert. Mit \"Hierher wechseln\" aktivieren.",
+                            "Endpoint saved in slot {n}. Activate it with \"Switch here\"."
+                        )
+                    }));
+                    self.reload();
+                }
+                Err(err) => {
+                    if let Some(dialog) = &mut self.endpoint_dialog {
+                        dialog.error = Some(format!("{err:#}"));
+                    }
+                }
+            }
+        } else if cancel || response.should_close() {
+            self.endpoint_dialog = None;
+        }
+    }
+
     fn confirm_dialog(&mut self, ctx: &egui::Context, action: &mut Option<Action>) {
         let Some(pending) = &self.pending else { return };
-        let email_in = |n: usize| {
-            self.slot(n)
-                .and_then(Slot::identity)
-                .map(|id| id.email)
-                .unwrap_or_default()
-        };
+        let email_in = |n: usize| self.slot(n).map(Slot::label).unwrap_or_default();
         let (title, text, confirm_label) = match pending {
             Pending::Capture(n) | Pending::Login { slot: n, .. } => {
                 let n = *n;
@@ -843,6 +1048,7 @@ impl eframe::App for App {
         });
         let ctx = ui.ctx().clone();
         self.login_dialog(&ctx);
+        self.endpoint_dialog(&ctx);
         self.confirm_dialog(&ctx, &mut action);
         if let Some(action) = action {
             self.run(action);
