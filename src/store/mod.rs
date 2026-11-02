@@ -24,5 +24,9 @@ pub fn active() -> Result<Box<dyn CredentialStore>> {
 
 #[cfg(target_os = "macos")]
 pub fn active() -> Result<Box<dyn CredentialStore>> {
+    // Tests arbeiten nur mit Dateien in einem Temp-Ordner, nie mit dem echten Schlüsselbund.
+    if cfg!(test) {
+        return Ok(Box::new(FileStore::new(crate::claude::credentials_path()?)));
+    }
     Ok(Box::new(keychain::KeychainStore::new()?))
 }

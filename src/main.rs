@@ -8,6 +8,7 @@ mod app;
 mod claude;
 mod cli;
 mod clipboard;
+mod endpoint;
 mod fsx;
 mod locks;
 mod login;
@@ -23,7 +24,11 @@ fn main() -> eframe::Result {
     let saved = slots::SlotStore::open().ok().and_then(|store| store.settings().language);
     i18n::set(saved.unwrap_or_else(i18n::system));
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Ältere macOS-Versionen übergeben beim Start aus dem Finder "-psn_…".
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| !arg.starts_with("-psn_"))
+        .collect();
     if !args.is_empty() {
         std::process::exit(cli::run(&args));
     }

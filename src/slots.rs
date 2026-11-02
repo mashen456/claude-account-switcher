@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::claude::{self, Identity};
+use crate::endpoint::{self, Endpoint};
 use crate::fsx;
 use crate::i18n::Lang;
 use crate::locks;
@@ -41,17 +42,60 @@ const SHARED_KEYS: [&str; 5] = [
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Slot {
-    /// Komplettes Token-Objekt wie in `.credentials.json`.
+    /// Komplettes Token-Objekt wie in `.credentials.json`. Bei Endpoint-Slots leer.
+    #[serde(default)]
     pub credentials: Value,
-    /// Block `oauthAccount` aus `~/.claude.json`.
+    /// Block `oauthAccount` aus `~/.claude.json`. Bei Endpoint-Slots leer.
+    #[serde(default)]
     pub oauth_account: Value,
+    /// Gesetzt bei einem Endpoint-Slot (eigener Server statt Claude-Account).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Endpoint>,
     pub saved_at: String,
 }
 
 impl Slot {
+    pub fn account(credentials: Value, oauth_account: Value) -> Self {
+        Self {
+            credentials,
+            oauth_account,
+            endpoint: None,
+            saved_at: now(),
+        }
+    }
+
+    pub fn with_endpoint(endpoint: Endpoint) -> Self {
+        Self {
+            credentials: Value::Null,
+            oauth_account: Value::Null,
+            endpoint: Some(endpoint),
+            saved_at: now(),
+        }
+    }
+
+    /// Account eines Account-Slots, `None` bei leeren und Endpoint-Slots.
     pub fn identity(&self) -> Option<Identity> {
+        if self.endpoint.is_some() {
+            return None;
+        }
         Identity::from_oauth_account(&self.oauth_account)
     }
+
+    /// E-Mail des Accounts bzw. Name des Endpoints.
+    pub fn label(&self) -> String {
+        match &self.endpoint {
+            Some(endpoint) => endpoint.display_name(),
+            None => self.identity().map(|id| id.email).unwrap_or_default(),
+        }
+    }
+}
+
+/// Wohin gewechselt wurde.
+pub struct Switched {
+    /// E-Mail des Accounts bzw. Name des Endpoints.
+    pub label: String,
+    /// Ein laufendes Claude Code muss neu gestartet werden (settings.json geändert).
+    pub restart_needed: bool,
 }
 
 /// Der Login, mit dem Claude Code gerade arbeitet.
@@ -135,8 +179,18 @@ impl SlotStore {
         if !(1..=count).contains(&n) {
             bail!(tr!("Slot {n} gibt es nicht", "There is no slot {n}"));
         }
+        let slot = self.load(n)?;
+        // Ein aktiver Endpoint ließe sich danach nicht mehr sauber abschalten.
+        if let Some(endpoint) = slot.as_ref().and_then(|slot| slot.endpoint.as_ref()) {
+            if endpoint::is_active(endpoint)? {
+                bail!(tr!(
+                    "Slot {n} ist gerade aktiv. Erst zu einem anderen Slot wechseln.",
+                    "Slot {n} is currently active. Switch to another slot first."
+                ));
+            }
+        }
         // Der aktive Login läge danach in keinem Slot, und Wechseln wäre gesperrt.
-        if let (Some(slot), Some(live)) = (self.load(n)?, read_live()?) {
+        if let (Some(slot), Some(live)) = (slot, read_live()?) {
             if slot.identity().is_some_and(|id| id.same_account(&live.identity)) {
                 bail!(tr!(
                     "Slot {n} ist gerade aktiv. Erst zu einem anderen Slot wechseln.",
@@ -197,14 +251,52 @@ impl SlotStore {
 
     /// Sicherheitskopie des Live-Logins, bevor er überschrieben wird.
     fn write_safety_copy(&self, live: &Live) -> Result<()> {
-        let copy = Slot {
-            credentials: live.credentials.clone(),
-            oauth_account: live.oauth_account.clone(),
-            saved_at: now(),
-        };
+        let copy = Slot::account(live.credentials.clone(), live.oauth_account.clone());
         let text = serde_json::to_string_pretty(&copy)?;
         fsx::write_atomic(&self.dir.join("last-live.json"), text.as_bytes())
     }
+
+    /// Der Endpoint-Slot, der gerade in `settings.json` eingetragen ist.
+    pub fn active_endpoint(&self) -> Result<Option<usize>> {
+        let env = endpoint::current_env()?;
+        for n in 1..=self.count() {
+            if let Some(endpoint) = self.load(n)?.and_then(|slot| slot.endpoint) {
+                if endpoint::is_active_in(&endpoint, &env) {
+                    return Ok(Some(n));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Ist (noch) ein Endpoint eingetragen, den dieses Programm gesetzt hat?
+    fn endpoint_engaged(&self) -> Result<bool> {
+        Ok(endpoint::backup_exists(&self.dir) || self.active_endpoint()?.is_some())
+    }
+}
+
+/// Legt einen Endpoint in Slot `n` ab (neu oder geändert). Ein Slot mit
+/// Claude-Account wird nicht überschrieben. War der bisherige Endpoint dieses
+/// Slots aktiv, werden die neuen Werte gleich eingetragen; liefert dann `true`.
+pub fn save_endpoint(slots: &SlotStore, n: usize, endpoint: Endpoint) -> Result<bool> {
+    let endpoint = endpoint.normalized()?;
+    let old = slots.load(n)?;
+    if let Some(id) = old.as_ref().and_then(Slot::identity) {
+        let email = id.email;
+        bail!(tr!(
+            "In Slot {n} liegt der Account {email}. Für einen Endpoint einen leeren Slot nehmen.",
+            "Slot {n} holds the account {email}. Use an empty slot for an endpoint."
+        ));
+    }
+    let was_active = match old.as_ref().and_then(|slot| slot.endpoint.as_ref()) {
+        Some(old) => endpoint::is_active(old)?,
+        None => false,
+    };
+    slots.save(n, &Slot::with_endpoint(endpoint.clone()))?;
+    if was_active {
+        endpoint::activate(slots.dir(), &endpoint)?;
+    }
+    Ok(was_active)
 }
 
 pub fn read_live() -> Result<Option<Live>> {
@@ -282,15 +374,23 @@ pub fn capture(slots: &SlotStore, n: usize) -> Result<Identity> {
             return Err(already_in_slot(&live.identity.email, other));
         }
     }
-    slots.save(
-        n,
-        &Slot {
-            credentials: live.credentials,
-            oauth_account: live.oauth_account,
-            saved_at: now(),
-        },
-    )?;
+    refuse_active_endpoint(slots, n)?;
+    slots.save(n, &Slot::account(live.credentials, live.oauth_account))?;
     Ok(live.identity)
+}
+
+/// Ein Endpoint, den Claude Code gerade nutzt, wird nicht überschrieben:
+/// danach ließe er sich nicht mehr sauber abschalten.
+fn refuse_active_endpoint(slots: &SlotStore, n: usize) -> Result<()> {
+    if let Some(endpoint) = slots.load(n)?.and_then(|slot| slot.endpoint) {
+        if endpoint::is_active(&endpoint)? {
+            bail!(tr!(
+                "Slot {n} ist der aktive Endpoint. Erst zu einem anderen Slot wechseln.",
+                "Slot {n} is the active endpoint. Switch to another slot first."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Legt einen frisch eingeloggten Account (siehe `login.rs`) in Slot `n` ab.
@@ -307,6 +407,7 @@ pub fn store_login(slots: &SlotStore, n: usize, mut slot: Slot) -> Result<(Ident
             return Err(already_in_slot(&id.email, other));
         }
     }
+    refuse_active_endpoint(slots, n)?;
     // Felder, die nur Claude Code nachlädt (z. B. Rollen), vom bisherigen Stand behalten.
     if let Some(old) = slots.load(n)? {
         if old.identity().is_some_and(|old_id| old_id.same_account(&id)) {
@@ -369,11 +470,24 @@ fn write_live(creds: &dyn CredentialStore, credentials: &Value, oauth_account: &
     Ok(())
 }
 
-/// Macht Slot `target` zum Login von Claude Code.
-pub fn switch_to(slots: &SlotStore, target: usize) -> Result<Identity> {
+/// Macht Slot `target` zum Login bzw. Endpoint von Claude Code.
+pub fn switch_to(slots: &SlotStore, target: usize) -> Result<Switched> {
     let target_slot = slots
         .load(target)?
         .ok_or_else(|| anyhow!(tr!("Slot {target} ist leer", "Slot {target} is empty")))?;
+
+    // Endpoint: nur settings.json, der Claude-Login bleibt, wie er ist.
+    if let Some(target_endpoint) = &target_slot.endpoint {
+        if endpoint::is_active(target_endpoint)? {
+            bail!(tr!("Slot {target} ist bereits aktiv", "Slot {target} is already active"));
+        }
+        endpoint::activate(slots.dir(), target_endpoint)?;
+        return Ok(Switched {
+            label: target_endpoint.display_name(),
+            restart_needed: true,
+        });
+    }
+
     let target_id = target_slot.identity().ok_or_else(|| {
         anyhow!(tr!("Slot {target} enthält keinen Account", "Slot {target} holds no account"))
     })?;
@@ -384,13 +498,23 @@ pub fn switch_to(slots: &SlotStore, target: usize) -> Result<Identity> {
         ));
     }
 
+    let endpoint_engaged = slots.endpoint_engaged()?;
     let creds = store::active()?;
     let _locks = locks::claude_locks()?;
     let live = read_live_from(&*creds)?;
+    let switched = Switched {
+        label: target_id.email.clone(),
+        restart_needed: endpoint_engaged,
+    };
 
     // 1. Bisherigen Account sichern.
     if let Some(live) = &live {
         if live.identity.same_account(&target_id) {
+            // Nur der Endpoint lag noch darüber: den abschalten genügt.
+            if endpoint_engaged {
+                endpoint::deactivate(slots.dir())?;
+                return Ok(switched);
+            }
             bail!(tr!("Slot {target} ist bereits aktiv", "Slot {target} is already active"));
         }
         let Some(current) = slots.find(&live.identity)? else {
@@ -407,11 +531,7 @@ pub fn switch_to(slots: &SlotStore, target: usize) -> Result<Identity> {
         if may_replace(&stored, &live.credentials) {
             slots.save(
                 current,
-                &Slot {
-                    credentials: live.credentials.clone(),
-                    oauth_account: live.oauth_account.clone(),
-                    saved_at: now(),
-                },
+                &Slot::account(live.credentials.clone(), live.oauth_account.clone()),
             )?;
         }
     }
@@ -422,7 +542,12 @@ pub fn switch_to(slots: &SlotStore, target: usize) -> Result<Identity> {
         &with_shared_keys(&target_slot.credentials, live.as_ref()),
         &target_slot.oauth_account,
     )?;
-    Ok(target_id)
+
+    // 3. Einen Endpoint, der noch darüber liegt, abschalten.
+    if endpoint_engaged {
+        endpoint::deactivate(slots.dir())?;
+    }
+    Ok(switched)
 }
 
 fn now() -> String {
@@ -435,14 +560,13 @@ mod tests {
     use serde_json::json;
 
     fn login_slot(who: &str, refresh: &str) -> Slot {
-        Slot {
-            credentials: json!({ "claudeAiOauth": { "accessToken": format!("at-{refresh}"),
-                                                    "refreshToken": refresh } }),
-            oauth_account: json!({ "accountUuid": format!("uuid-{who}"),
-                                   "emailAddress": format!("{who}@example.com"),
-                                   "organizationUuid": format!("org-{who}") }),
-            saved_at: now(),
-        }
+        Slot::account(
+            json!({ "claudeAiOauth": { "accessToken": format!("at-{refresh}"),
+                                       "refreshToken": refresh } }),
+            json!({ "accountUuid": format!("uuid-{who}"),
+                    "emailAddress": format!("{who}@example.com"),
+                    "organizationUuid": format!("org-{who}") }),
+        )
     }
 
     fn read(path: &Path) -> Value {
@@ -521,6 +645,71 @@ mod tests {
         }
         assert_eq!(slots.count(), MAX_SLOTS);
         assert!(slots.add_slot().is_err());
+
+        // Endpoint-Slots: eigene Einstellungen in settings.json bleiben erhalten.
+        let settings_path = config.join("settings.json");
+        fs::write(
+            &settings_path,
+            json!({ "theme": "dark", "env": { "FOO": "1", "ANTHROPIC_MODEL": "user-model" } }).to_string(),
+        )
+        .unwrap();
+        let runpod = Endpoint {
+            name: "Runpod".into(),
+            base_url: "https://abc.api.runpod.ai/".into(),
+            auth_token: "rpa_secret".into(),
+            model: "qwen3-coder-next".into(),
+        };
+        assert!(!save_endpoint(&slots, 2, runpod.clone()).unwrap());
+        assert!(save_endpoint(&slots, 1, runpod.clone()).is_err(), "account slot is kept");
+        assert_eq!(slots.load(2).unwrap().unwrap().label(), "Runpod");
+        assert_eq!(slots.active_endpoint().unwrap(), None);
+
+        let switched = switch_to(&slots, 2).unwrap();
+        assert!(switched.restart_needed);
+        assert_eq!(switched.label, "Runpod");
+        let settings = read(&settings_path);
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["env"]["FOO"], "1");
+        assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], "https://abc.api.runpod.ai");
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "rpa_secret");
+        assert_eq!(settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "qwen3-coder-next");
+        assert_eq!(slots.active_endpoint().unwrap(), Some(2));
+        // Der Claude-Login bleibt unberührt.
+        assert_eq!(read(&config.join(".credentials.json"))["claudeAiOauth"]["refreshToken"], "A-new");
+        assert!(switch_to(&slots, 2).is_err());
+        assert!(slots.remove_slot(2).is_err());
+        assert!(capture(&slots, 2).is_err());
+
+        // Aktiven Endpoint bearbeiten: die neuen Werte landen sofort in settings.json.
+        let changed = Endpoint { model: "other-model".into(), ..runpod.clone() };
+        assert!(save_endpoint(&slots, 2, changed).unwrap());
+        assert_eq!(read(&settings_path)["env"]["ANTHROPIC_MODEL"], "other-model");
+
+        // Zurück zum selben Account: nur der Endpoint verschwindet, alte Werte zurück.
+        let switched = switch_to(&slots, 1).unwrap();
+        assert!(switched.restart_needed);
+        assert_eq!(switched.label, "a@example.com");
+        let settings = read(&settings_path);
+        assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "user-model");
+        assert_eq!(settings["env"]["FOO"], "1");
+        assert!(settings["env"].get("ANTHROPIC_BASE_URL").is_none());
+        assert!(settings["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert_eq!(slots.active_endpoint().unwrap(), None);
+        assert!(switch_to(&slots, 1).is_err(), "already active");
+
+        // Endpoint → anderer Account: Token wechselt, Endpoint wird abgeschaltet.
+        fs::write(&settings_path, "{}").unwrap();
+        store_login(&slots, 3, login_slot("c", "C2")).unwrap();
+        switch_to(&slots, 2).unwrap();
+        let switched = switch_to(&slots, 3).unwrap();
+        assert_eq!(switched.label, "c@example.com");
+        assert_eq!(read(&config.join(".credentials.json"))["claudeAiOauth"]["refreshToken"], "C2");
+        assert_eq!(read(&settings_path), json!({}));
+        assert!(!endpoint::backup_exists(slots.dir()));
+
+        // Leerer Slot nach einem Endpoint wieder als Account nutzbar.
+        slots.remove_slot(2).unwrap();
+        assert_eq!(email(&slots, 2).as_deref(), Some("c@example.com"));
 
         let _ = fs::remove_dir_all(&root);
     }
